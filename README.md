@@ -1,12 +1,27 @@
 # 云顶山景区观光车排队上车与站点调度平台
 
-把**票务、排队、车辆、站点、退票**联动起来的全栈演示系统：游客、站点工作人员、司机、调度中心、客服/主管、财务六类角色围绕**同一张车票 / 同一班车**协同处理，目标是减少热门站点拥堵，并在异常（满载跳站、误乘反方向、老人优先争议、车辆故障、司机交班延误、暴雨停运、退票争议）发生时自动联动所有相关方。
+把**票务、排队、车辆、站点、退票**联动起来的全栈演示系统：游客、站点工作人员、司机、调度中心、客服/主管、财务六类角色围绕**同一张车票 / 同一班车**协同处理，目标是减少热门站点拥堵，并在异常（满载跳站、误乘反方向、老人优先争议、车辆故障、司机交班延误、**暴雨临时停运**、退票争议）发生时自动联动所有相关方。
 
 - 后端：NestJS 10 + TypeORM（**默认 SQLite，零外部依赖；可通过环境变量切换 MySQL**）
 - 前端：React 18 + Vite + Ant Design 5
-- 启动后自动建表并写入演示种子数据（2 条线路 / 10 个站点 / 6 辆车 / 4 名司机 / 6 张在途票与排队）
+- 提供 **Dockerfile + docker-compose.yml 一键启动**（前端 Nginx 托管并反代后端）
+- 启动后自动建表并写入演示种子数据（2 条线路 / 10 个站点 / 6 辆车 / 4 名司机 / 7 张票，覆盖在途/排队/未检票三种状态）
 
 ---
+
+## 〇、一键启动（Docker，推荐）
+
+需要 Docker + Docker Compose。在仓库根目录：
+
+```bash
+docker compose up --build
+```
+
+- 前端：<http://localhost:8080> （Nginx 托管静态资源并把 `/api` 反代到后端）
+- 后端 API：<http://localhost:3001/api>
+- SQLite 数据持久化在 `server-data` 卷；停止后 `docker compose down`，加 `-v` 可同时清空数据卷重放种子。
+
+无需 Docker 时可用下面的本地 Node.js 方式分别启动前后端。
 
 ## 一、本地启动
 
@@ -53,7 +68,7 @@ cd server && npm start
 | --- | --- | --- |
 | 司机 | 王建国(1)、陈志强(2)、李海燕(3)、赵师傅(4) | 陈志强驾驶 V02 正在东门上客；李海燕连续驾驶 300 分钟被标记强制休息 |
 | 车辆 | V01~V06 | V06 电量 18% 正在充电；V05 为 20 座/3 轮椅位大车；均支持或部分支持无障碍 |
-| 车票 | `T20260925-001` ~ `T20260925-006` | 001~004 在东门枢纽排队（003 为轮椅老人优先组），005 已在车上 |
+| 车票 | `T20260925-001` ~ `T20260925-007` | 001~004 在东门枢纽排队（003 为轮椅老人优先组），005 已在车上，006 在湖滨码头排队，007 刚入园尚未检票（停运演示第三类） |
 | 站点 | 东门枢纽(1)、百花园(2)、山顶观景台(3)、玻璃栈道(4)、索道换乘(5)、南门服务区(6)；湖滨码头(7)、湿地栈道(8)、湖心岛(9)、西大门(10) | 东门/山顶/玻璃栈道/湖心岛为热门站 |
 | 班次 | `TR20260925-001` | V02 上行（东门→玻璃栈道）正在上客，可直接检票 |
 
@@ -74,7 +89,7 @@ cd server && npm start
 | 老人优先争议 | 站务一键上报 `priority_dispute`，客服工作台接单并可闭环 |
 | 车辆故障 | 司机上报 → 车辆转故障、在运班停运、调度派备车、游客无责退票，事件串联票/车/班 |
 | 司机交班延误 | 上报后其计划班自动变「延误」并禁止再派班，看板与调度建议同步提示 |
-| 暴雨临时停运 | 天气达橙色（level≥3）：一键停运所有在运/计划班；已上车票转客服无责退票，候乘游客引导离队退票；停运期间派班被阻断 |
+| 暴雨临时停运 | 天气达橙色（level≥3）一键停运：生成停运单并**锁定受影响车票、站点排队与在途车辆**，按「在途车辆 / 站点排队 / 未检票订单」三类分别处理；游客在车票页**改乘 / 延期 / 退票三选一**；调度逐车登记**司机收车与车辆充电安排**；停运期间派班/入队/检票全部阻断；**财务按票种（单程¥20、环线¥35、亲子¥30、无障碍¥20 每人）核算改期挂账与退票金额**；客服端展示**统一答复口径**与处置进度；退票金额同步财务→**财务确认**→出账→**退票单自动归档**；恢复后改乘/延期车票解锁 |
 | 退票 | 游客/站务发起 → 生成退票单+事件 → 客服核准/驳回；争议一键**升级客服主管**终局裁决 → 财务出账；每一步都写在车票时间线上 |
 | 团队包车 | 申请→调度配车（校验座位/轮椅位）→车辆预留→开始用车→完单释放 |
 | 无障碍 | 无障碍车辆标识、轮椅位库存、轮椅位检票占用、包车轮椅位校验 |
@@ -94,23 +109,31 @@ cd server && npm start
 4. **调度中心页**：
    - 直接派班 V06 或选李海燕，观察**多重阻断原因**；
    - 用 V01+王建国派班成功；
-   - 「天气与管制」里把预警改成等级 3（暴雨橙色）→ 出现**一键停运**；
+   - 「天气与道路管制」里把预警改成等级 3（暴雨橙色）→ 出现**一键停运**，确认后到「🌧 暴雨停运台」处置：
+     - 看三类锁定数（在途车辆 / 站点排队 / 未检票订单）与按票种金额汇总；
+     - 对车辆「登记收车 → 开始充电 → 充满完成」；
+     - 恢复运营按钮在同页右上角；
    - 包车页代客登记 18 人+2 轮椅团队，先配小车被拒、再配 V05 成功。
-5. **客服页**：处理退票（同意/驳回/升级主管），在「主管争议裁决」完成终局裁决。
-6. **财务页**：对已核准退票单笔「出账退款」。
-7. **运营复盘页**：查看站点等待、车辆利用率、投诉原因、退票成本四张图表与 KPI。
-8. 回到**游客页**查询被退款车票，可见游客→客服→（主管）→财务的完整时间线。
+5. **游客页**：查询在途/排队/未检票任一种子票（如 `T…-005` 在途、`T…-002` 排队、`T…-007` 未检票），停运后出现红色**暴雨停运处置**横幅：分别试 **改乘 / 免费延期（选日期）/ 按票种全额退票**，金额按票种与人数自动显示。
+6. **客服页**：「🌧 暴雨停运口径」页查看统一答复口径、三类处置进度与按票种金额；其余退票在「退票审核」处理（同意/驳回/升级主管）。
+7. **财务页**：停运退票已按政策自动核准并**同步到「① 待确认」**→ 点「财务确认」核对票种单价×人数 → 进「② 待出账」点「出账退款」→ 在「📁 退票归档」查看自动归档单；未确认的退票单不能出账。
+8. 回到**调度中心**恢复运营（先把天气改回无预警）：改乘/延期票解锁、已退款票保持已退款，可重新派班。
+9. **运营复盘页**：查看站点等待、车辆利用率、投诉原因（含暴雨停运）、退票成本（暴雨已付金额）与 KPI。
+10. 回到**游客页**查询被退款车票，可见调度锁定→游客选择→（财务确认/出账）→归档的完整时间线。
 
-### 自动化验证（后端端到端，36 项断言）
+### 自动化验证（后端端到端，67 项断言）
 
-后端启动状态下另开终端：
+后端启动状态下另开终端（脚本也会自动拉起一个干净后端，端口 3099）：
 
 ```bash
-node server/scripts/scenario-check.mjs
-# 输出 36 通过 / 0 失败
+npm test
+# 等价于：node server/scripts/scenario-check.mjs
+# 输出 67 通过 / 0 失败
 ```
 
-该脚本覆盖：优先检票、始发站校验、派班多重阻断、安检不合格转维保、反方向拦截、满载跳站、车辆故障、退票核准→财务出账、争议升级主管裁决、暴雨停运与派班阻断、交班延误推迟下一班、包车座位/轮椅校验、广播限流、车票时间线、复盘报表。
+该脚本覆盖：优先检票、始发站/方向校验、派班多重阻断、安检不合格转维保、反方向拦截、满载跳站、车辆故障、常规退票核准→**财务确认**→出账→归档、争议升级主管裁决、**暴雨停运全链路（三类锁定、派班/入队阻断、改乘/延期/退票三选一、按票种金额、收车充电、客服口径、财务确认与归档、恢复解锁）**、交班延误、包车座位/轮椅校验、复盘报表。
+
+> 脚本会使用临时库 `/tmp/scenic-storm-check.sqlite`，不影响你本地的演示数据；也可用 `API_BASE=http://127.0.0.1:3001/api node server/scripts/scenario-check.mjs` 指向已运行的后端。
 
 ---
 
@@ -137,7 +160,8 @@ DB_TYPE=mysql DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASSWORD=root DB_NA
 - 票务：`POST /tickets`、`GET /tickets/:id`（含票的完整事件时间线）、`GET /tickets/code/:code`、`POST /tickets/:id/refund`
 - 站点：`GET /overview`、`GET /routes`、`GET /stations/:id/board`、`POST /stations/:id/enqueue`、`POST /stations/:id/board-next`、`POST /queue/:id/board`、`POST /queue/:id/dispute`、`POST /broadcasts`、`PATCH /stations/:id`
 - 调度：`GET /dispatch/dashboard`、`POST /trips`、`POST /trips/:id/start-boarding|arrive|leave|complete`、`POST /safety-checks`、`POST /vehicles/:id/fault|charge|repair`、`POST /drivers/:id/duty|handover-delay`、`POST /weather`、`POST /road-controls`、`POST /dispatch/storm-suspend|resume`、`GET /geofence-events`、`POST /charters`、`POST /charters/:id/assign|status`
-- 客服/财务：`GET /service/workbench`、`POST /refunds/:id/approve|reject|escalate|supervisor-decide|pay`、`POST /incidents/:id/take|resolve`、`GET /incidents`
+- 暴雨停运：`POST /storm/suspend|resume`、`GET /storm/board|list|service-board`、`GET /storm/ticket/:ticketId`、`POST /storm/affected/:id/choose`（改乘/延期/退票）、`POST /storm/garage/:id/collect|charge`（司机收车/车辆充电安排）、`GET /storm/archives`
+- 客服/财务：`GET /service/workbench`、`GET /finance/ledger`、`POST /refunds/:id/approve|reject|escalate|supervisor-decide|finance-confirm|pay`、`POST /incidents/:id/take|resolve`、`GET /incidents`
 - 复盘：`GET /ops/report`
 
 ## 七、目录结构
@@ -145,10 +169,15 @@ DB_TYPE=mysql DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASSWORD=root DB_NA
 ```
 server/                 NestJS 后端
   src/
-    entities.ts         15 张表：线路/站点/车辆/司机/安检/班次/车票/排队/事件/退票/广播/天气/管制/围栏/包车
-    tickets/ stations/ dispatch/ service/ ops/ incidents/
-    seed.service.ts     演示种子数据
+    entities.ts         19 张表：线路/站点/车辆/司机/安检/班次/车票/排队/事件/退票/广播/天气/管制/围栏/包车
+                        +暴雨停运单/受影响票处置/收车充电安排/退票归档
+    tickets/ stations/ dispatch/ service/ ops/ incidents/ storm/
+    seed.service.ts     演示种子数据（含 1 张未检票订单）
+  scripts/
+    scenario-check.mjs  端到端校验脚本（67 项断言，可自启干净后端）
+  Dockerfile            后端镜像（node:20 + dist 产物）
 web/                    React 前端
-  src/pages/            7 个角色工作台
-scripts/                端到端校验脚本（在 server/scripts/）
+  src/pages/            7 个角色工作台（调度含暴雨停运台，客服含停运口径，财务含确认/归档）
+  Dockerfile/nginx.conf 前端镜像（Nginx 托管 + /api 反代）
+docker-compose.yml      一键启动前后端
 ```

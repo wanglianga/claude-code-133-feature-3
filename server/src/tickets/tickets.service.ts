@@ -4,6 +4,7 @@ import { Repository } from 'typeorm';
 import { Ticket, Refund, QueueEntry, Station, Incident } from '../entities';
 import { BuyTicketDto, RefundRequestDto } from './dto';
 import { IncidentsService } from '../incidents/incidents.service';
+import { StormService } from '../storm/storm.service';
 import { now, seqCode, ticketPrice, waitSeconds } from '../common';
 
 @Injectable()
@@ -14,6 +15,7 @@ export class TicketsService {
     @InjectRepository(QueueEntry) private readonly queue: Repository<QueueEntry>,
     @InjectRepository(Station) private readonly stations: Repository<Station>,
     private readonly incidents: IncidentsService,
+    private readonly stormSvc: StormService,
   ) {}
 
   /** 游客购票：记录入园时间、起终站、同行人数、婴儿车/老人儿童、预计路线 */
@@ -84,6 +86,7 @@ export class TicketsService {
       this.stations.findOne({ where: { id: ticket.originStationId } }),
       this.stations.findOne({ where: { id: ticket.destStationId } }),
     ]);
+    const stormInfo = await this.stormSvc.ticketStormInfo(id);
     return {
       ticket,
       origin,
@@ -91,6 +94,7 @@ export class TicketsService {
       queueEntries,
       refunds,
       incidents: incs,
+      stormInfo,
       typeLabel: this.typeName(ticket.type),
       currentWaitSeconds: queueEntries.length
         ? waitSeconds(queueEntries[queueEntries.length - 1].enqueueAt)
@@ -113,6 +117,9 @@ export class TicketsService {
     }
     if (ticket.status === 'refund_pending') throw new BadRequestException('该票已在退票审核中');
     if (ticket.status === 'refunded') throw new BadRequestException('该票已退款');
+    if (ticket.stormLocked) {
+      throw new BadRequestException('暴雨临时停运中：请通过停运处置选择「改乘 / 延期 / 退票」，停运退票按票种全额且无需客服审核');
+    }
 
     const r = this.refunds.create({
       code: seqCode('RF'),

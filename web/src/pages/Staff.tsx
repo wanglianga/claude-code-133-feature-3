@@ -11,6 +11,7 @@ import { useApi } from '../hooks';
 
 export default function StaffPage() {
   const { data: overview } = useApi<any>('/overview');
+  const { data: storm } = useApi<any>('/storm/board');
   const [stationId, setStationId] = useState<number>(1);
   const [ticketCode, setTicketCode] = useState('');
   const [broadcastOpen, setBroadcastOpen] = useState(false);
@@ -143,6 +144,15 @@ export default function StaffPage() {
         }}>景点限流</Button>
         <span className="muted">平板模式：为站务工作人员展示本站排队、检票、车辆与天气</span>
       </Space>
+
+      {storm?.suspension?.status === 'active' && (
+        <Alert type="error" showIcon icon={<WarningOutlined />}
+          message={<Space><b>🌧 {storm.suspension.warningLabel}临时停运中（{storm.suspension.code}）</b>
+            <Tag color="red">在途 {storm.counts.onboard}</Tag>
+            <Tag color="orange">排队 {storm.counts.queuing}</Tag>
+            <Tag color="gold">未检票 {storm.counts.unticketed}</Tag></Space>}
+          description="本站排队已锁定、检票与入队暂停。请引导游客在游客端车票页选择「改乘 / 延期 / 退票」，停运退票按票种全额、免手续费，财务确认后原路退回。统一口径见客服工作台。" />
+      )}
 
       {board && (
         <>

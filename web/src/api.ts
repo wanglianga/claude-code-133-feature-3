@@ -59,3 +59,25 @@ export const TRIP_STATUS: Record<string, { text: string; color: string }> = {
   suspended: { text: '已停运', color: 'red' },
   delayed: { text: '延误', color: 'orange' },
 };
+
+export const STORM_PHASE: Record<string, { text: string; color: string }> = {
+  onboard: { text: '在途车辆', color: 'red' },
+  queuing: { text: '站点排队', color: 'orange' },
+  unticketed: { text: '未检票订单', color: 'gold' },
+};
+
+export const STORM_OPTION: Record<string, { text: string; color: string }> = {
+  keep: { text: '待选择', color: 'default' },
+  transfer: { text: '改乘', color: 'blue' },
+  postpone: { text: '延期', color: 'purple' },
+  refund: { text: '退票', color: 'cyan' },
+};
+
+export const STORM_AFFECTED_STATUS: Record<string, { text: string; color: string }> = {
+  pending: { text: '待游客选择', color: 'orange' },
+  transferred: { text: '已改乘', color: 'blue' },
+  postponed: { text: '已延期', color: 'purple' },
+  refund_pending: { text: '待财务出账', color: 'gold' },
+  refunded: { text: '已退款归档', color: 'green' },
+  closed: { text: '已关闭（恢复有效）', color: 'default' },
+};

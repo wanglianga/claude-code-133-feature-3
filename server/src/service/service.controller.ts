@@ -10,6 +10,11 @@ export class ServiceController {
     return this.svc.workbench();
   }
 
+  @Get('finance/ledger')
+  ledger() {
+    return this.svc.financeLedger();
+  }
+
   @Post('refunds/:id/approve')
   approve(@Param('id') id: string, @Body() body: { note: string }) {
     return this.svc.approve(Number(id), body.note);
@@ -31,6 +36,13 @@ export class ServiceController {
     return this.svc.supervisorDecide(Number(id), body);
   }
 
+  /* 财务确认退票（金额按票种核对） */
+  @Post('refunds/:id/finance-confirm')
+  financeConfirm(@Param('id') id: string, @Body() body: { note?: string }) {
+    return this.svc.financeConfirm(Number(id), body.note);
+  }
+
+  /* 财务出账退款（须先确认；出账后自动归档） */
   @Post('refunds/:id/pay')
   pay(@Param('id') id: string, @Body() body: { note?: string }) {
     return this.svc.pay(Number(id), body.note);

@@ -6,6 +6,7 @@ import {
   RoadControl, GeofenceEvent, SafetyCheck, CharterOrder,
 } from '../entities';
 import { IncidentsService } from '../incidents/incidents.service';
+import { StormService } from '../storm/storm.service';
 import { now, seqCode, waitSeconds } from '../common';
 
 const MIN_BATTERY = 20;       // 低于 20% 禁止发车
@@ -30,6 +31,7 @@ export class DispatchService {
     @InjectRepository(SafetyCheck) private readonly checks: Repository<SafetyCheck>,
     @InjectRepository(CharterOrder) private readonly charters: Repository<CharterOrder>,
     private readonly incidentSvc: IncidentsService,
+    private readonly stormSvc: StormService,
   ) {}
 
   /* ================= 调度看板 ================= */
@@ -321,6 +323,11 @@ export class DispatchService {
     if (weatherRow && weatherRow.warningLevel >= STORM_LEVEL) {
       blockers.push(`${weatherRow.warning}，按预案暂停发车`);
     }
+    // 暴雨停运单生效中：全线或本线路锁定，派班一律阻断
+    const activeStorm = await this.stormSvc.activeSuspension(origin.routeId);
+    if (activeStorm) {
+      blockers.push(`暴雨临时停运中（${activeStorm.code}：${activeStorm.warningLabel}），请先恢复运营`);
+    }
     if (blockers.length) throw new BadRequestException(blockers.join('；'));
 
     if (v.battery <= WARN_BATTERY) warnings.push(`电量仅 ${v.battery}%，本班结束后必须回库充电`);
@@ -550,70 +557,15 @@ export class DispatchService {
     return this.vehicles.save(v);
   }
 
-  /* ================= 暴雨临时停运 ================= */
+  /* ================= 暴雨临时停运（委托 storm 模块） ================= */
 
   async stormSuspend(reason: string, routeId?: number) {
-    const weather = (await this.weatherRepo.find({ order: { id: 'DESC' }, take: 1 }))[0];
-    const label = weather?.warning || '暴雨';
-    const qb = this.trips.createQueryBuilder('t')
-      .where('t.status IN (:...s)', { s: ['scheduled', 'boarding', 'running', 'delayed'] });
-    if (routeId) qb.andWhere('t.routeId = :r', { r: routeId });
-    const activeTrips = await qb.getMany();
-
-    for (const t of activeTrips) {
-      t.status = 'suspended';
-      t.suspendReason = `${label}临时停运：${reason}`;
-      await this.trips.save(t);
-
-      // 已检票游客 → 自动生成停运退票单（客服批量复核、财务付款）
-      const onboard = await this.tickets.find({ where: { tripId: t.id, status: 'boarded' } });
-      for (const tk of onboard) {
-        await this.incidentSvc.create({
-          type: 'storm_suspension', severity: 'critical',
-          title: `${label}停运：${tk.visitorName} 所乘 ${t.code} 中断`,
-          detail: `已上车游客由站点接驳避雨，票款走无责退票（客服复核 → 财务退款）`,
-          ticketId: tk.id, tripId: t.id,
-          raisedByRole: 'dispatch', ownerRole: 'service',
-          firstNote: `调度宣布停运：${reason}`,
-        });
-      }
-      // 站台候乘游客 → 退回排队前状态，引导退票
-      const stations = await this.stations.find({ where: { routeId: t.routeId } });
-      const stationIds = stations.map(s => s.id);
-      const waitingEntries = await this.queue.find({
-        where: { stationId: In(stationIds), status: In(['waiting', 'called', 'skipped']) },
-      });
-      for (const e of waitingEntries) {
-        e.status = 'transferred';
-        await this.queue.save(e);
-        const tk = await this.tickets.findOne({ where: { id: e.ticketId } });
-        if (tk && ['queued', 'valid'].includes(tk.status)) {
-          tk.status = 'valid';
-          await this.tickets.save(tk);
-        }
-      }
-
-      const v = await this.vehicles.findOne({ where: { id: t.vehicleId } });
-      if (v) { v.status = 'idle'; v.currentTripId = null; await this.vehicles.save(v); }
-      const d = await this.drivers.findOne({ where: { id: t.driverId } });
-      if (d) { d.status = 'on_duty'; d.currentVehicleId = null; await this.drivers.save(d); }
-
-      await this.incidentSvc.create({
-        type: 'storm_suspension', severity: 'critical',
-        title: `${label}临时停运：${t.code}`,
-        detail: `${reason}｜在班车就近停靠，候乘游客 ${waitingEntries.length} 组已引导离队（可改签/退票）`,
-        tripId: t.id, vehicleId: t.vehicleId,
-        raisedByRole: 'dispatch', ownerRole: 'dispatch',
-        firstNote: '调度中心启动暴雨停运预案',
-      });
-    }
-    return { suspendedTrips: activeTrips.map(t => t.code) };
+    return this.stormSvc.suspend({ reason, routeId });
   }
 
   /** 停运恢复（预警解除），允许重新派班 */
   async resumeOperation() {
-    const suspended = await this.trips.find({ where: { status: 'suspended' } });
-    return { ok: true, note: '预警已解除，可重新派班', suspendedStillOpen: suspended.length };
+    return this.stormSvc.resume({ note: '预警解除，恢复运营' });
   }
 
   /* ================= 天气 / 管制 ================= */

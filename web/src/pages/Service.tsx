@@ -2,7 +2,7 @@ import { useState } from 'react';
 import {
   Card, Table, Tag, Space, Button, Tabs, Badge, Modal, Input, message, Typography, Alert, Empty,
 } from 'antd';
-import { api, fen, TICKET_TYPE } from '../api';
+import { api, fen, TICKET_TYPE, STORM_PHASE, STORM_AFFECTED_STATUS } from '../api';
 import { useApi } from '../hooks';
 
 const FAULT_LABEL: Record<string, string> = {
@@ -68,10 +68,17 @@ export default function ServicePage() {
         <div className="stat-card"><div className="l">待审退票</div><div className="v" style={{ color: '#d46b08' }}>{wb?.counts?.pendingRefund ?? 0}</div></div>
         <div className="stat-card"><div className="l">主管处理中</div><div className="v" style={{ color: '#722ed1' }}>{wb?.counts?.escalated ?? 0}</div></div>
         <div className="stat-card"><div className="l">待处理事件</div><div className="v">{wb?.counts?.openIncident ?? 0}</div></div>
+        <div className="stat-card"><div className="l">停运待游客选择</div><div className="v" style={{ color: '#cf1322' }}>{wb?.counts?.stormPendingChoice ?? 0}</div></div>
+        <div className="stat-card"><div className="l">停运退票待财务</div><div className="v" style={{ color: '#d48806' }}>{wb?.counts?.stormRefundPending ?? 0}</div></div>
       </div>
 
       <Tabs
         items={[
+          {
+            key: 'storm',
+            label: '🌧 暴雨停运口径',
+            children: <StormServicePanel storm={wb?.storm} refresh={refresh} />,
+          },
           {
             key: 'pending',
             label: <Badge count={pending.length} size="small">退票审核</Badge>,
@@ -91,6 +98,62 @@ export default function ServicePage() {
           },
         ]}
       />
+    </Space>
+  );
+}
+
+/** 客服端：暴雨停运统一口径 + 处置进度（只读跟踪，退票由财务确认） */
+function StormServicePanel({ storm, refresh }: { storm: any; refresh: () => void }) {
+  if (!storm || !storm.suspension) {
+    return <Alert type="info" showIcon message="当前没有进行中的暴雨停运" description="停运发起后，客服在此查看统一答复口径，并跟踪每张受影响票的改乘/延期/退票进度。" />;
+  }
+  const sus = storm.suspension;
+  const c = storm.counts;
+  return (
+    <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Alert type={sus.status === 'active' ? 'error' : 'success'} showIcon
+        message={<Space wrap><b>{sus.code}</b><Tag color={sus.status === 'active' ? 'red' : 'green'}>{sus.status === 'active' ? '停运中' : '已恢复'}</Tag>{sus.warningLabel}</Space>}
+        description={sus.serviceScript} />
+
+      <div className="stat-row">
+        <div className="stat-card"><div className="l">在途车辆票</div><div className="v">{c.onboard}</div></div>
+        <div className="stat-card"><div className="l">站点排队票</div><div className="v">{c.queuing}</div></div>
+        <div className="stat-card"><div className="l">未检票订单</div><div className="v">{c.unticketed}</div></div>
+        <div className="stat-card"><div className="l">改乘 / 延期</div><div className="v" style={{ color: '#1677ff' }}>{c.transferred} / {c.postponed}</div></div>
+        <div className="stat-card"><div className="l">退票待财务 / 已退</div><div className="v">{c.refundPending} / {c.refunded}</div></div>
+      </div>
+
+      <Card title="按票种退票/改期金额口径（答复游客用）" size="small">
+        <Table rowKey="ticketType" size="small" pagination={false} dataSource={storm.byType}
+          columns={[
+            { title: '票种', dataIndex: 'ticketTypeLabel' },
+            { title: '单价', dataIndex: 'unitPrice', render: (n: number) => fen(n) },
+            { title: '受影响', dataIndex: 'count' },
+            { title: '退票金额', dataIndex: 'refundAmount', render: (n: number) => <b style={{ color: '#cf1322' }}>{fen(n)}</b> },
+            { title: '改期挂账', dataIndex: 'rescheduleAmount', render: (n: number) => fen(n) },
+          ]} />
+      </Card>
+
+      <Card title="受影响票处置进度（与游客答复保持同一口径）" size="small"
+        extra={<Button size="small" onClick={refresh}>刷新进度</Button>}>
+        <Table rowKey="id" size="small" pagination={{ pageSize: 10 }} dataSource={storm.affected}
+          columns={[
+            { title: '游客', key: 'v', render: (_: any, r: any) =>
+              <Space direction="vertical" size={0}><b>{r.visitorName}（{r.partySize}人）</b><span className="muted">{r.ticketTypeLabel}</span></Space> },
+            { title: '分类', dataIndex: 'phase', render: (p: string) => <Tag color={STORM_PHASE[p]?.color}>{STORM_PHASE[p]?.text}</Tag> },
+            { title: '选择', dataIndex: 'option', render: (o: string, r: any) =>
+              o && o !== 'keep' ? <Tag>{({ transfer: '改乘', postpone: '延期', refund: '退票' } as any)[o]}{r.postponedDate ? ` ${r.postponedDate}` : ''}</Tag> : <Tag>待选择</Tag> },
+            { title: '退票金额', dataIndex: 'refundAmount', render: (n: number) => n ? fen(n) : '—' },
+            { title: '状态', dataIndex: 'status', render: (s: string) => <Tag color={STORM_AFFECTED_STATUS[s]?.color}>{STORM_AFFECTED_STATUS[s]?.text}</Tag> },
+            { title: '退票单/财务', key: 'rf', render: (_: any, r: any) =>
+              r.refund ? <Space direction="vertical" size={0}>
+                <span className="muted">{r.refund.code}</span>
+                <Tag color={r.refund.status === 'paid' ? 'green' : r.refund.financeConfirmed ? 'blue' : 'gold'}>
+                  {r.refund.status === 'paid' ? '财务已出账归档' : r.refund.financeConfirmed ? '财务已确认待出账' : '待财务确认'}
+                </Tag>
+              </Space> : '—' },
+          ]} />
+      </Card>
     </Space>
   );
 }

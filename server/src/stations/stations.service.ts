@@ -6,6 +6,7 @@ import {
   Broadcast, RoadControl, Incident,
 } from '../entities';
 import { IncidentsService } from '../incidents/incidents.service';
+import { StormService } from '../storm/storm.service';
 import { now, waitSeconds } from '../common';
 
 const LONG_QUEUE_RATIO = 1.2; // 排队人数超站台容量 1.2 倍判定过长
@@ -24,6 +25,7 @@ export class StationsService {
     @InjectRepository(RoadControl) private readonly controls: Repository<RoadControl>,
     @InjectRepository(Incident) private readonly incidents: Repository<Incident>,
     private readonly incidentSvc: IncidentsService,
+    private readonly stormSvc: StormService,
   ) {}
 
   /* ---------------- 线路 / 站点 / 天气 ---------------- */
@@ -150,6 +152,9 @@ export class StationsService {
     const station = await this.stations.findOne({ where: { id: stationId } });
     if (!station) throw new NotFoundException('站点不存在');
     if (station.status === 'closed') throw new BadRequestException('该站点已关闭');
+    if (await this.stormSvc.activeSuspension(station.routeId)) {
+      throw new BadRequestException('暴雨临时停运期间本站暂停入队与检票，请引导游客在车票页选择改乘/延期/退票');
+    }
     const ticket = await this.tickets.findOne({ where: { code: ticketCode.trim() } });
     if (!ticket) throw new NotFoundException('车票号无效');
     if (ticket.originStationId !== stationId) {
@@ -159,6 +164,9 @@ export class StationsService {
     }
     if (!['valid', 'queued'].includes(ticket.status)) {
       throw new BadRequestException(`车票当前状态「${ticket.status}」不可排队`);
+    }
+    if (ticket.stormLocked) {
+      throw new BadRequestException('暴雨临时停运中：该车票已锁定，请游客先在车票页选择改乘/延期/退票，运营恢复后再排队');
     }
     const exist = await this.queue.findOne({
       where: { ticketId: ticket.id, status: In(['waiting', 'called']) },
@@ -217,6 +225,9 @@ export class StationsService {
     }
     const ticket = await this.tickets.findOne({ where: { id: entry.ticketId } });
     if (!ticket) throw new NotFoundException('车票不存在');
+    if (ticket.stormLocked) {
+      throw new BadRequestException('暴雨临时停运中：该车票已锁定，请引导游客改乘/延期/退票，不可检票');
+    }
     const trip = await this.trips.findOne({ where: { id: tripId } });
     if (!trip) throw new NotFoundException('班次不存在');
     if (!['boarding', 'running'].includes(trip.status)) {

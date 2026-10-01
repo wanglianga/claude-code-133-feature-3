@@ -1,9 +1,10 @@
 import { useMemo, useState } from 'react';
 import {
   Card, Form, Select, InputNumber, Input, Button, Switch, Tag, Timeline, Typography,
-  Space, Alert, Divider, Descriptions, Modal, Empty,
+  Space, Alert, Divider, Descriptions, Modal, Empty, DatePicker,
 } from 'antd';
-import { api, fen, TICKET_TYPE, TICKET_STATUS } from '../api';
+import dayjs from 'dayjs';
+import { api, fen, TICKET_TYPE, TICKET_STATUS, STORM_PHASE, STORM_AFFECTED_STATUS } from '../api';
 import { useAction, useApi } from '../hooks';
 
 export default function VisitorPage() {
@@ -143,7 +144,7 @@ function RefundForm({ setValues }: { setValues?: (v: any) => void }) {
 }
 
 function TicketDetail({ detail, onRefund, onChanged }: { detail: any; onRefund: () => void; onChanged: () => void }) {
-  const { ticket, origin, dest, incidents, typeLabel } = detail;
+  const { ticket, origin, dest, incidents, typeLabel, stormInfo } = detail;
   const st = TICKET_STATUS[ticket.status];
   const canRefund = ['valid', 'queued'].includes(ticket.status);
 
@@ -165,7 +166,9 @@ function TicketDetail({ detail, onRefund, onChanged }: { detail: any; onRefund: 
       <Descriptions column={3} bordered size="small">
         <Descriptions.Item label="票号">{ticket.code}</Descriptions.Item>
         <Descriptions.Item label="票种">{typeLabel}</Descriptions.Item>
-        <Descriptions.Item label="状态"><Tag color={st.color}>{st.text}</Tag></Descriptions.Item>
+        <Descriptions.Item label="状态"><Tag color={st.color}>{st.text}</Tag>
+          {ticket.stormLocked && <Tag color="red" style={{ marginLeft: 6 }}>暴雨停运已锁定</Tag>}
+        </Descriptions.Item>
         <Descriptions.Item label="游客">{ticket.visitorName}（{ticket.partySize} 人）</Descriptions.Item>
         <Descriptions.Item label="行程">{origin.name} → {dest.name}</Descriptions.Item>
         <Descriptions.Item label="方向">{ticket.expectedDirection === 'forward' ? '上行' : ticket.expectedDirection === 'backward' ? '下行' : '环线'}</Descriptions.Item>
@@ -177,6 +180,9 @@ function TicketDetail({ detail, onRefund, onChanged }: { detail: any; onRefund: 
           <Typography.Text type="secondary"> ｜路线：{ticket.plannedRoute}</Typography.Text>
         </Descriptions.Item>
       </Descriptions>
+
+      {stormInfo && <StormPanel info={stormInfo} onChanged={onChanged} />}
+
       <Divider orientation="left" style={{ fontSize: 13 }}>事件时间线（游客 / 站务 / 司机 / 调度 / 客服 / 财务）</Divider>
       <Timeline
         items={incidents.flatMap((inc: any) => {
@@ -193,12 +199,99 @@ function TicketDetail({ detail, onRefund, onChanged }: { detail: any; onRefund: 
           }));
         })}
       />
-      <Space>
-        <Button danger disabled={!canRefund} onClick={refund}>
-          {canRefund ? '申请退票' : '当前状态不可直接退票（如已上车请联系客服争议处理）'}
-        </Button>
-      </Space>
+      {!stormInfo && (
+        <Space>
+          <Button danger disabled={!canRefund} onClick={refund}>
+            {canRefund ? '申请退票' : '当前状态不可直接退票（如已上车请联系客服争议处理）'}
+          </Button>
+        </Space>
+      )}
     </div>
+  );
+}
+
+/** 暴雨停运处置：统一口径 + 改乘/延期/退票三选一 */
+function StormPanel({ info, onChanged }: { info: any; onChanged: () => void }) {
+  const { affected, suspension } = info;
+  const active = suspension?.status === 'active';
+  const [busy, setBusy] = useState(false);
+  const chooseable = active && affected.status === 'pending';
+
+  const choose = (option: 'transfer' | 'postpone' | 'refund') => {
+    const go = async (postponedDate?: string) => {
+      setBusy(true);
+      try {
+        await api.post(`/storm/affected/${affected.id}/choose`, { option, postponedDate });
+        onChanged();
+      } finally { setBusy(false); }
+    };
+    if (option === 'refund') {
+      Modal.confirm({
+        title: `确认暴雨停运无责退票？可退 ${fen(affected.faceAmount)}`,
+        content: `按${affected.ticketTypeLabel}全额（${fen(affected.unitPrice)}/人 × ${affected.partySize}人），免手续费，提交后由财务确认并原路退回。`,
+        okText: '确认退票',
+        okButtonProps: { danger: true },
+        onOk: () => go(),
+      });
+    } else if (option === 'postpone') {
+      let date = dayjs().add(1, 'day').format('YYYY-MM-DD');
+      Modal.confirm({
+        title: '免费延期乘坐',
+        width: 420,
+        content: (
+          <Space direction="vertical" style={{ marginTop: 8 }}>
+            <Typography.Text>票款 {fen(affected.faceAmount)} 挂账保留，运营恢复后凭原票乘车，免手续费。</Typography.Text>
+            <DatePicker defaultValue={dayjs().add(1, 'day')} onChange={d => { if (d) date = d.format('YYYY-MM-DD'); }} />
+          </Space>
+        ),
+        okText: '确认延期',
+        onOk: () => go(date),
+      });
+    } else {
+      Modal.confirm({
+        title: '确认改乘恢复后班次？',
+        content: `运营恢复后由工作人员安排就近班次接驳，免手续费，票款 ${fen(affected.faceAmount)} 挂账保留。`,
+        okText: '确认改乘',
+        onOk: () => go(),
+      });
+    }
+  };
+
+  return (
+    <Alert
+      style={{ margin: '12px 0' }}
+      type={active ? 'error' : 'success'} showIcon
+      message={
+        <Space wrap>
+          <b>🌧 暴雨临时停运处置</b>
+          <Tag color={STORM_PHASE[affected.phase]?.color}>{STORM_PHASE[affected.phase]?.text}</Tag>
+          <Tag color={STORM_AFFECTED_STATUS[affected.status]?.color}>{STORM_AFFECTED_STATUS[affected.status]?.text}</Tag>
+          {affected.postponedDate && <Tag color="purple">延期至 {affected.postponedDate}</Tag>}
+        </Space>
+      }
+      description={
+        <Space direction="vertical" style={{ width: '100%' }} size={8}>
+          <Typography.Paragraph style={{ marginBottom: 0 }} className="muted">
+            {suspension?.serviceScript}
+          </Typography.Paragraph>
+          <Space wrap>
+            <span>票面：{affected.ticketTypeLabel} {affected.partySize} 人，金额 {fen(affected.faceAmount)}</span>
+            {affected.refundAmount > 0 && <Tag color="red">退票金额 {fen(affected.refundAmount)}</Tag>}
+            {affected.rescheduleAmount > 0 && <Tag color="purple">改期保留 {fen(affected.rescheduleAmount)}</Tag>}
+          </Space>
+          {chooseable && (
+            <Space wrap>
+              <Button type="primary" loading={busy} onClick={() => choose('transfer')}>改乘（恢复后接驳）</Button>
+              <Button style={{ background: '#722ed1', borderColor: '#722ed1' }} loading={busy} onClick={() => choose('postpone')}>免费延期</Button>
+              <Button danger loading={busy} onClick={() => choose('refund')}>按票种全额退票 {fen(affected.faceAmount)}</Button>
+            </Space>
+          )}
+          {!active && affected.status === 'closed' && (
+            <Typography.Text type="secondary">运营已恢复，您的车票已解锁，可重新扫码排队乘车。</Typography.Text>
+          )}
+        </Space>
+      }
+    />
   );
 }
 

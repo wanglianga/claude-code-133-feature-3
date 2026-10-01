@@ -7,6 +7,7 @@ import {
 import { DispatchService } from './dispatch.service';
 import { DispatchController } from './dispatch.controller';
 import { IncidentsModule } from '../incidents/incidents.module';
+import { StormModule } from '../storm/storm.module';
 
 @Module({
   imports: [
@@ -15,6 +16,7 @@ import { IncidentsModule } from '../incidents/incidents.module';
       RoadControl, GeofenceEvent, SafetyCheck, CharterOrder, Incident, Refund,
     ]),
     IncidentsModule,
+    StormModule,
   ],
   providers: [DispatchService],
   controllers: [DispatchController],

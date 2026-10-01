@@ -215,7 +215,14 @@ export class SeedService implements OnApplicationBootstrap {
     t6.status = 'queued';
     await this.tickets.save(t6);
 
+    // 一张已购票、尚未到站排队的票（停运时归入“未检票订单”）
+    const t7 = await mkTicket({
+      visitorName: '冯雨（刚入园）', type: 'single', partySize: 1,
+      price: ticketPrice('single', 1),
+      plannedRoute: '东门枢纽 → 山顶观景台',
+    });
+
     // eslint-disable-next-line no-console
-    console.log('[seed] 演示数据已写入：2 条线路 / 10 个站点 / 6 辆车 / 4 名司机 / 6 张票');
+    console.log('[seed] 演示数据已写入：2 条线路 / 10 个站点 / 6 辆车 / 4 名司机 / 7 张票（含 1 张未检票）');
   }
 }

@@ -6,7 +6,7 @@ import {
 import {
   CloudServerOutlined, ThunderboltOutlined, WarningOutlined,
 } from '@ant-design/icons';
-import { api, TRIP_STATUS } from '../api';
+import { api, fen, TRIP_STATUS, STORM_PHASE, STORM_AFFECTED_STATUS } from '../api';
 import { useApi } from '../hooks';
 
 export default function DispatchPage() {
@@ -63,6 +63,7 @@ export default function DispatchPage() {
 
       <Tabs
         items={[
+          { key: 'storm', label: '🌧 暴雨停运台', children: <StormTab refresh={refresh} /> },
           { key: 'board', label: '站点与车辆', children: <BoardTab dash={dash} loading={loading} geo={geo} refresh={refresh} /> },
           { key: 'dispatch', label: '派班发车', children: <DispatchTab dash={dash} refresh={refresh} /> },
           { key: 'charter', label: '团队包车', children: <CharterTab dash={dash} refresh={refresh} /> },
@@ -392,10 +393,10 @@ function WeatherTab({ dash, refresh }: any) {
         {level >= 3 && (
           <Alert style={{ marginTop: 12 }} type="error" showIcon
             message={`${warning || '高级别气象预警'}：可执行全线临时停运`}
-            action={<Popconfirm title="确认全线临时停运？在班车立即中断、候乘游客引导退票、已上车票自动转客服"
+            action={<Popconfirm title="确认全线临时停运？在途车辆、站点排队与未检票订单将分别锁定，游客三选一，司机收车/车辆充电逐车登记"
               onConfirm={async () => {
                 const r = await api.post('/dispatch/storm-suspend', { reason: `${warning}，降雨量 ${rain}mm/h` });
-                message.success(`已停运 ${r.suspendedTrips.length} 个班次`);
+                message.success(`已停运 ${r.suspension.affectedTrips} 个班次，锁定车票 ${r.counts.total} 张，请到「暴雨停运台」处置`);
                 refresh();
               }}>
               <Button danger type="primary">一键临时停运</Button>
@@ -447,4 +448,161 @@ function AddControl({ stations, onDone }: { stations: any[]; onDone: () => void 
 
 function vehicleStatus(s: string) {
   return ({ idle: '待命', running: '在运', charging: '充电', maintenance: '维保', breakdown: '故障' } as any)[s] || s;
+}
+
+/* ================= 暴雨临时停运台 ================= */
+
+function StormTab({ refresh }: { refresh: () => void }) {
+  const [tick, setTick] = useState(0);
+  const { data: board, loading } = useApi<any>(`/storm/board?t=${tick}`, [tick]);
+  const reload = () => { setTick(t => t + 1); refresh(); };
+  const sus = board?.suspension;
+
+  if (!sus) {
+    return (
+      <Alert type="info" showIcon
+        message="当前没有进行中的暴雨停运单"
+        description="在「天气与道路管制」页把预警更新为橙色（等级≥3）后，可一键执行全线临时停运：系统将锁定受影响车票、站点排队与在途车辆，登记司机收车与车辆充电安排，并同步客服统一口径。" />
+    );
+  }
+
+  const active = sus.status === 'active';
+  const c = board.counts;
+  const t = board.totals;
+
+  return (
+    <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Alert
+        type={active ? 'error' : 'success'} showIcon
+        message={
+          <Space wrap>
+            <b>{sus.code}</b>
+            <Tag color={active ? 'red' : 'green'}>{active ? '停运中' : '已恢复'}</Tag>
+            <span>{sus.warningLabel}（等级 {sus.warningLevel}）</span>
+            <span className="muted">{sus.reason}</span>
+          </Space>
+        }
+        description={sus.serviceScript}
+        action={active ? (
+          <Popconfirm
+            title="确认预警解除、恢复运营？"
+            description="改乘/延期/未选择的车票将解锁恢复有效；退票处理中的票继续由财务完成。"
+            onConfirm={async () => {
+              await api.post('/storm/resume', { note: '预警解除，恢复运营' });
+              message.success('已恢复运营，车票/排队锁解除');
+              reload();
+            }}>
+            <Button type="primary" ghost danger>恢复运营</Button>
+          </Popconfirm>
+        ) : <Tag color="green">{new Date(sus.resumedAt).toLocaleString('zh-CN')} 已恢复</Tag>}
+      />
+
+      <Row gutter={12}>
+        <Col xs={12} md={6}><Card><Statistic title="在途车辆票（已上车）" value={c.onboard} valueStyle={{ color: '#cf1322' }} /></Card></Col>
+        <Col xs={12} md={6}><Card><Statistic title="站点排队票" value={c.queuing} valueStyle={{ color: '#d46b08' }} /></Card></Col>
+        <Col xs={12} md={6}><Card><Statistic title="未检票订单" value={c.unticketed} valueStyle={{ color: '#d4b106' }} /></Card></Col>
+        <Col xs={12} md={6}><Card><Statistic title="待游客选择" value={c.pending} /></Card></Col>
+        <Col xs={12} md={6}><Card><Statistic title="已改乘" value={c.transferred} valueStyle={{ color: '#1677ff' }} /></Card></Col>
+        <Col xs={12} md={6}><Card><Statistic title="已延期" value={c.postponed} valueStyle={{ color: '#722ed1' }} /></Card></Col>
+        <Col xs={12} md={6}><Card><Statistic title="待财务出账" value={c.refundPending} valueStyle={{ color: '#d48806' }} /></Card></Col>
+        <Col xs={12} md={6}><Card><Statistic title="已退款归档" value={c.refunded} valueStyle={{ color: '#389e0d' }} /></Card></Col>
+      </Row>
+
+      <Card title="财务口径：按票种生成改期 / 退票金额">
+        <Table rowKey="ticketType" size="small" pagination={false} loading={loading} dataSource={board.byType}
+          columns={[
+            { title: '票种', dataIndex: 'ticketTypeLabel' },
+            { title: '单价(分/人)', dataIndex: 'unitPrice', width: 110, render: (n: number) => fen(n) },
+            { title: '受影响', dataIndex: 'count', width: 90 },
+            { title: '退票笔数', dataIndex: 'refundCount', width: 90 },
+            { title: '退票金额', dataIndex: 'refundAmount', width: 120, render: (n: number) => <b style={{ color: '#cf1322' }}>{fen(n)}</b> },
+            { title: '改期笔数', dataIndex: 'rescheduleCount', width: 90 },
+            { title: '改期挂账金额', dataIndex: 'rescheduleAmount', width: 130, render: (n: number) => fen(n) },
+          ]} />
+        <div style={{ marginTop: 12 }} className="muted">
+          合计：退票应退 <b style={{ color: '#cf1322' }}>{fen(t.refundAmount)}</b>
+          ｜已退 {fen(t.refundPaid)}
+          ｜改期/改乘挂账保留 {fen(t.rescheduleAmount)}
+        </div>
+      </Card>
+
+      <Card title="司机收车与车辆充电安排（停运期间逐车登记）">
+        <Table rowKey="id" size="small" pagination={false} dataSource={board.garage}
+          columns={[
+            { title: '车辆', key: 'v', render: (_: any, r: any) =>
+              <Space direction="vertical" size={0}><b>{r.vehicleCode}</b><span className="muted">{r.vehiclePlate}</span></Space> },
+            { title: '司机', dataIndex: 'driverName', width: 90 },
+            { title: '停运时电量', key: 'b', width: 110, render: (_: any, r: any) =>
+              <span style={{ color: r.batteryAtSuspend < 35 ? '#cf1322' : undefined }}>{r.batteryAtSuspend}%（当前 {r.currentBattery}%）</span> },
+            { title: '收车', key: 'c', width: 110, render: (_: any, r: any) =>
+              r.collectStatus === 'returned'
+                ? <Tag color="green">已收车 {r.collectedAt ? new Date(r.collectedAt).toLocaleTimeString('zh-CN') : ''}</Tag>
+                : <Tag color="orange">待收车</Tag> },
+            { title: '充电安排', key: 'ch', width: 120, render: (_: any, r: any) =>
+              <Tag color={({ pending: 'orange', scheduled: 'gold', charging: 'blue', done: 'green' } as any)[r.chargeStatus] || 'default'}>
+                {r.chargeStatusLabel}
+              </Tag> },
+            {
+              title: '操作', key: 'op', width: 300,
+              render: (_: any, r: any) => (
+                <Space wrap>
+                  {r.collectStatus !== 'returned' && (
+                    <Button size="small" type="primary"
+                      onClick={() => Modal.confirm({
+                        title: `登记司机收车：${r.vehicleCode} / ${r.driverName}`,
+                        content: <Input.TextArea id="collect-note" rows={2} defaultValue="司机已就近安全停靠、断电巡视并收车回库" />,
+                        onOk: async () => {
+                          const note = (document.getElementById('collect-note') as HTMLTextAreaElement)?.value || '';
+                          await api.post(`/storm/garage/${r.id}/collect`, { note });
+                          message.success('收车已登记'); reload();
+                        },
+                      })}>登记收车</Button>
+                  )}
+                  {r.collectStatus === 'returned' && ['pending', 'scheduled'].includes(r.chargeStatus) && (
+                    <Button size="small" onClick={async () => {
+                      await api.post(`/storm/garage/${r.id}/charge`, { action: 'charging' });
+                      message.success('已开始充电'); reload();
+                    }}>开始充电</Button>
+                  )}
+                  {r.collectStatus === 'returned' && r.chargeStatus === 'charging' && (
+                    <Button size="small" type="primary" ghost onClick={async () => {
+                      await api.post(`/storm/garage/${r.id}/charge`, { action: 'done', target: 100 });
+                      message.success('充电完成，车辆转待命'); reload();
+                    }}>充满完成</Button>
+                  )}
+                  {r.collectStatus === 'returned' && r.chargeStatus === 'pending' && (
+                    <Button size="small" type="text" onClick={async () => {
+                      await api.post(`/storm/garage/${r.id}/charge`, { action: 'not_needed' });
+                      message.success('已标记电量充足无需充电'); reload();
+                    }}>无需充电</Button>
+                  )}
+                </Space>
+              ),
+            },
+          ]} />
+      </Card>
+
+      <Card title={`受影响车票处置（${board.affected.length} 张：在途/排队/未检票分别处理，游客三选一）`}>
+        <Table rowKey="id" size="small" pagination={{ pageSize: 10 }} dataSource={board.affected}
+          columns={[
+            { title: '游客', key: 'p', render: (_: any, r: any) =>
+              <Space direction="vertical" size={0}><b>{r.visitorName}（{r.partySize}人）</b>
+                <span className="muted">{r.ticketTypeLabel} · {fen(r.unitPrice)}/人</span></Space> },
+            { title: '分类', dataIndex: 'phase', width: 110, render: (p: string) =>
+              <Tag color={STORM_PHASE[p]?.color}>{STORM_PHASE[p]?.text}</Tag> },
+            { title: '所在', key: 'loc', width: 140, render: (_: any, r: any) => r.tripCode || r.stationName || '—' },
+            { title: '游客选择', dataIndex: 'option', width: 90, render: (o: string, r: any) =>
+              o && o !== 'keep' ? <Tag color={({ transfer: 'blue', postpone: 'purple', refund: 'cyan' } as any)[o]}>{({ transfer: '改乘', postpone: '延期', refund: '退票' } as any)[o]}{r.postponedDate ? ` ${r.postponedDate}` : ''}</Tag> : <Tag>待选择</Tag> },
+            { title: '退票/改期金额', key: 'amt', width: 150, render: (_: any, r: any) =>
+              <Space direction="vertical" size={0}>
+                {r.refundAmount > 0 && <span style={{ color: '#cf1322' }}>退 {fen(r.refundAmount)}</span>}
+                {r.rescheduleAmount > 0 && <span style={{ color: '#722ed1' }}>改期挂账 {fen(r.rescheduleAmount)}</span>}
+                {!r.refundAmount && !r.rescheduleAmount && <span className="muted">票面 {fen(r.faceAmount)}</span>}
+              </Space> },
+            { title: '状态', dataIndex: 'status', width: 120, render: (s: string) =>
+              <Tag color={STORM_AFFECTED_STATUS[s]?.color}>{STORM_AFFECTED_STATUS[s]?.text}</Tag> },
+          ]} />
+      </Card>
+    </Space>
+  );
 }

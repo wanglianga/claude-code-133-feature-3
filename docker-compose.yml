@@ -1,0 +1,30 @@
+# 一键启动：docker compose up --build
+# 前端 http://localhost:8080 （Nginx 托管并反代 /api）
+# 后端 http://localhost:3001/api
+services:
+  server:
+    build: ./server
+    container_name: scenic-server
+    ports:
+      - "3001:3001"
+    volumes:
+      - server-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/weather').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  web:
+    build: ./web
+    container_name: scenic-web
+    ports:
+      - "8080:80"
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  server-data:
