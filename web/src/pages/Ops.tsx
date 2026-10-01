@@ -21,6 +21,7 @@ export default function OpsPage() {
         <div className="stat-card"><div className="l">平均等待</div><div className="v">{waitText(k.avgWaitSeconds)}</div></div>
         <div className="stat-card"><div className="l">退票率</div><div className="v" style={{ color: k.refundRate > 10 ? '#cf1322' : undefined }}>{k.refundRate}%</div></div>
         <div className="stat-card"><div className="l">退票成本(已付)</div><div className="v" style={{ color: '#cf1322' }}>{fen(k.refundPaidTotal)}</div></div>
+        <div className="stat-card"><div className="l">已归档单据</div><div className="v">{k.archivedCount ?? 0}</div></div>
         <div className="stat-card"><div className="l">未闭环事件</div><div className="v">{k.openIncidents}</div></div>
       </div>
 

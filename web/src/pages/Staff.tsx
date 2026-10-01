@@ -6,7 +6,7 @@ import {
 import {
   CloudOutlined, SoundOutlined, ReloadOutlined, WarningOutlined,
 } from '@ant-design/icons';
-import { api, TICKET_TYPE, TRIP_STATUS, waitText } from '../api';
+import { api, TICKET_TYPE, TRIP_STATUS, waitText, STORM_OPTION } from '../api';
 import { useApi } from '../hooks';
 
 export default function StaffPage() {
@@ -172,7 +172,12 @@ export default function StaffPage() {
             </Col>
           </Row>
 
-          {board.controls?.length > 0 && (
+          {board.stormActive && (
+            <Alert type="error" showIcon icon={<WarningOutlined />}
+              message={`暴雨临时停运中（${board.stormActive.warning}）：本站停止检票与叫号，队列已锁定保留顺位`}
+              description="请按客服统一口径引导游客：在游客页/客服端选择改乘、延期或全额退票；恢复运营后未退票游客按原顺位优先乘车。" />
+          )}
+          {board.controls?.length > 0 && !board.stormActive && (
             <Alert type="warning" showIcon icon={<WarningOutlined />}
               message="道路管制提示"
               description={board.controls.map((c: any) => `${c.segment}：${c.reason}`).join('；')} />
@@ -185,7 +190,9 @@ export default function StaffPage() {
             <Space style={{ width: '100%' }}>
               <Input style={{ maxWidth: 320 }} placeholder="扫描/输入车票号，如 T20260925-001"
                 value={ticketCode} onChange={e => setTicketCode(e.target.value)} onPressEnter={enqueue} />
-              <Button type="primary" onClick={enqueue}>扫码排队</Button>
+              <Button type="primary" onClick={enqueue} disabled={!!board.stormActive}>
+                {board.stormActive ? '暴雨停运中，暂停入队' : '扫码排队'}
+              </Button>
               <span className="muted">提示：东门枢纽队列含种子游客 T20260925-001~004</span>
             </Space>
           </Card>
@@ -213,6 +220,33 @@ export default function StaffPage() {
               locale={{ emptyText: <Empty description="本站当前无人排队" /> }}
               rowClassName={(r: any) => r.priority ? 'priority-row' : ''} />
           </Card>
+
+          {board.stormActive && (
+            <Card title={<Space>暴雨停运·锁定队列（停止检票，顺位保留；游客三选一后此处更新）
+              <Badge count={board.stormLockedQueue?.length || 0} color="#cf1322" /></Space>}>
+              <Table rowKey="id" size="small" pagination={false}
+                dataSource={board.stormLockedQueue || []}
+                locale={{ emptyText: <Empty description="本站无被锁定队列（可能游客尚未入队）" /> }}
+                columns={[
+                  { title: '顺位', key: 'order', width: 60, render: (_: any, __: any, i: number) => i + 1 },
+                  { title: '游客 / 票', key: 'v', render: (_: any, r: any) =>
+                    <Space direction="vertical" size={0}>
+                      <b>{r.ticket?.visitorName}</b>
+                      <span className="muted">{r.ticket?.code} · {TICKET_TYPE[r.ticket?.type] || ''}</span>
+                    </Space> },
+                  { title: '人数', dataIndex: 'partySize', width: 70 },
+                  { title: '锁定状态', dataIndex: 'status', width: 110, render: (s: string) =>
+                    s === 'storm_postponed' ? <Tag color="purple">已延期离队</Tag>
+                      : <Tag color="red">停运锁定</Tag> },
+                  { title: '游客选择', key: 'opt', render: (_: any, r: any) =>
+                    r.ticket?.stormOption
+                      ? <Tag color={STORM_OPTION[r.ticket.stormOption]?.color}>
+                          {STORM_OPTION[r.ticket.stormOption]?.text}{r.ticket?.postponeDate ? ` ${r.ticket.postponeDate}` : ''}
+                        </Tag>
+                      : <Tag>待选择（请引导）</Tag> },
+                ]} />
+            </Card>
+          )}
 
           <Card title="途经本站班车（车辆位置 · 座位余量 · 轮椅位）">
             <Table rowKey="id" size="small" pagination={false} dataSource={board.trips}

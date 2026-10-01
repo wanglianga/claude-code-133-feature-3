@@ -82,18 +82,19 @@ export class OpsService {
     })).filter(x => x.count > 0).sort((a, b) => b.count - a.count);
 
     /* ---- 退票成本 ---- */
-    const paid = refunds.filter(r => r.status === 'paid');
+    const paid = refunds.filter(r => ['paid', 'archived'].includes(r.status));
     const approved = refunds.filter(r => r.status === 'approved');
     const pending = refunds.filter(r => r.status === 'pending');
     const escalated = refunds.filter(r => r.status === 'escalated');
+    const archived = refunds.filter(r => r.archived);
     const byFault = (['storm', 'vehicle', 'schedule', 'visitor', 'other'] as const).map(f => {
       const rows = refunds.filter(r => r.faultTag === f);
       return {
         fault: f,
         label: ({ storm: '暴雨停运', vehicle: '车辆故障', schedule: '调度延误', visitor: '游客自身', other: '其他' } as Record<string, string>)[f],
         count: rows.length,
-        paidAmount: rows.filter(r => r.status === 'paid').reduce((a, r) => a + r.amount, 0),
-        approvedAmount: rows.filter(r => ['approved', 'paid'].includes(r.status)).reduce((a, r) => a + r.amount, 0),
+        paidAmount: rows.filter(r => ['paid', 'archived'].includes(r.status)).reduce((a, r) => a + r.amount, 0),
+        approvedAmount: rows.filter(r => ['approved', 'paid', 'archived'].includes(r.status)).reduce((a, r) => a + r.amount, 0),
       };
     }).filter(x => x.count > 0);
 
@@ -121,9 +122,11 @@ export class OpsService {
         return w.length ? Math.round(w.reduce((a, b) => a + b, 0) / w.length) : 0;
       })(),
       refundRate: allTickets.length
-        ? Math.round((refunds.filter(r => ['approved', 'paid'].includes(r.status)).length / allTickets.length) * 100)
+        ? Math.round((refunds.filter(r => r.kind === 'refund'
+            && ['approved', 'paid', 'archived'].includes(r.status)).length / allTickets.length) * 100)
         : 0,
       refundPaidTotal,
+      archivedCount: archived.length,
       ticketRevenue,
       pendingRefund: pending.length + approved.length,
       escalatedRefund: escalated.length,

@@ -128,9 +128,43 @@ export class DispatchController {
     return this.svc.stormSuspend(body.reason, body.routeId);
   }
 
+  @Get('dispatch/storm-overview')
+  stormOverview() {
+    return this.svc.stormOverview();
+  }
+
+  @Get('dispatch/suspensions')
+  suspensions() {
+    return this.svc.listSuspensions();
+  }
+
+  /** 调度登记司机收车 */
+  @Post('dispatch/storm-return')
+  stormReturn(@Body() body: {
+    suspensionId: number; tripId?: number; vehicleId: number; driverId: number;
+    returnStation: string; onboardPeople: number; note?: string;
+  }) {
+    return this.svc.stormReturnVehicle(body);
+  }
+
+  /** 登记停运后车辆充电安排 */
+  @Post('dispatch/storm-charge-plan')
+  stormChargePlan(@Body() body: {
+    suspensionId: number; vehicleId: number; targetBattery?: number;
+    slot?: string; plannedAt?: string; note?: string;
+  }) {
+    return this.svc.stormChargePlan(body);
+  }
+
+  /** 充电安排推进：开始充电 / 充电完成 */
+  @Post('dispatch/storm-charge-plan/:id/status')
+  stormChargeUpdate(@Param('id') id: string, @Body() body: { status: 'charging' | 'done' }) {
+    return this.svc.stormChargeUpdate(Number(id), body.status);
+  }
+
   @Post('dispatch/resume')
-  resume() {
-    return this.svc.resumeOperation();
+  resume(@Body() body: { note?: string }) {
+    return this.svc.resumeOperation(body.note);
   }
 
   /* 包车 */

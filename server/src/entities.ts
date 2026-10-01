@@ -41,7 +41,8 @@ export class Vehicle {
   @Column({ default: true }) accessible: boolean;       // 无障碍车辆
   @Column('int', { default: 100 }) battery: number;     // 电量 %
   @Column({ default: 'idle' })
-  status: 'idle' | 'running' | 'charging' | 'maintenance' | 'breakdown';
+  status: 'idle' | 'running' | 'returning' | 'charging' | 'maintenance' | 'breakdown';
+  @Column({ default: false }) stormReturnPending: boolean; // 暴雨停运后等待调度登记收车
   @Column('float', { default: 0 }) lat: number;
   @Column('float', { default: 0 }) lng: number;
   @Column({ nullable: true }) currentStationId: number | null;
@@ -101,6 +102,8 @@ export class Trip {
   @Column('simple-json', { nullable: true }) skippedStations: number[] | null;
   @Column({ default: '' }) suspendReason: string;
   @Column({ default: '' }) delayReason: string;
+  @Column({ nullable: true }) suspensionId: number | null; // 暴雨停运单
+  @Column({ default: false }) stormReturned: boolean;      // 司机已收车登记
 }
 
 /* ---------------- 车票与排队 ---------------- */
@@ -129,6 +132,15 @@ export class Ticket {
   status: 'valid' | 'queued' | 'boarded' | 'used'
         | 'refund_pending' | 'refunded' | 'refund_rejected' | 'cancelled';
   @Column({ nullable: true }) tripId: number | null;
+  /* ---- 暴雨临时停运联动 ---- */
+  @Column({ default: false }) stormLocked: boolean;       // 停运期间平台锁定
+  @Column({ nullable: true }) suspensionId: number | null;
+  @Column({ default: '' })
+  stormCategory: '' | 'onboard' | 'queued' | 'unchecked'; // 在途/排队/未检票 三类分别处理
+  @Column({ default: '' })
+  stormOption: '' | 'transfer' | 'postpone' | 'refund';   // 游客选择：改乘/延期/退票
+  @Column({ nullable: true }) stormOptionAt: string | null;
+  @Column({ nullable: true }) postponeDate: string | null;
   @Column() createdAt: string;
 }
 
@@ -141,11 +153,13 @@ export class QueueEntry {
   @Column({ default: false }) priority: boolean;
   @Column({ default: '' }) expectedDirection: string;
   @Column({ default: 'waiting' })
-  status: 'waiting' | 'called' | 'boarded' | 'left' | 'skipped' | 'transferred';
+  status: 'waiting' | 'called' | 'boarded' | 'left' | 'skipped'
+          | 'transferred' | 'storm_locked' | 'storm_postponed';
   @Column() enqueueAt: string;
   @Column({ nullable: true }) boardAt: string | null;
   @Column({ nullable: true }) tripId: number | null;
   @Column('int', { default: 0 }) waitSeconds: number;
+  @Column({ nullable: true }) suspensionId: number | null; // 暴雨停运锁定批次
 }
 
 /* ---------------- 事件中心（票 / 班车串联所有角色） ---------------- */
@@ -186,14 +200,25 @@ export class Refund {
   @PrimaryGeneratedColumn() id: number;
   @Column() code: string;
   @Column() ticketId: number;
-  @Column('int') amount: number;            // 分
+  @Column('int') amount: number;            // 分（退票=退款金额；改乘/改期=手续费）
+  @Column('int', { default: 0 }) carriedAmount: number; // 改乘/改期结转保留的原票款（分）
+  @Column({ default: 'refund' })
+  kind: 'refund' | 'transfer' | 'postpone'; // 退票 / 改乘 / 延期改期
   @Column({ default: '' }) reason: string;
   @Column({ default: '' }) faultTag: 'visitor' | 'storm' | 'vehicle' | 'schedule' | 'other';
   @Column({ default: 'pending' })
-  status: 'pending' | 'approved' | 'rejected' | 'escalated' | 'paid';
+  status: 'pending' | 'approved' | 'rejected' | 'escalated' | 'paid' | 'archived';
   @Column({ default: 'visitor' }) applicantRole: 'visitor' | 'staff' | 'system';
   @Column({ default: '' }) serviceNote: string;
   @Column({ default: '' }) supervisorNote: string;
+  @Column({ nullable: true }) suspensionId: number | null; // 来源：暴雨停运单
+  /* ---- 财务确认与归档 ---- */
+  @Column({ default: '' }) financeNote: string;
+  @Column({ default: '' }) financePayChannel: string;       // 原路退回/线下现金/对公
+  @Column({ nullable: true }) financeConfirmedAt: string | null;
+  @Column({ default: false }) archived: boolean;
+  @Column({ nullable: true }) archivedAt: string | null;
+  @Column({ nullable: true }) archiveNo: string | null;     // 归档单号 AR20260925-xxx
   @Column() createdAt: string;
   @Column({ nullable: true }) processedAt: string | null;
   @Column({ nullable: true }) paidAt: string | null;
@@ -266,7 +291,63 @@ export class CharterOrder {
   @Column() createdAt: string;
 }
 
+/* ---------------- 暴雨临时停运 ---------------- */
+
+@Entity('storm_suspensions')
+export class StormSuspension {
+  @PrimaryGeneratedColumn() id: number;
+  @Column() code: string;              // SS20260925-001
+  @Column({ nullable: true }) routeId: number | null;  // null = 全线
+  @Column({ default: '暴雨橙色预警' }) warning: string;
+  @Column() reason: string;
+  @Column({ default: 'active' }) status: 'active' | 'resumed'; // 停运中 / 已恢复
+  @Column() startedAt: string;
+  @Column({ nullable: true }) resumedAt: string | null;
+  @Column({ default: '' }) resumeNote: string;
+  // 三类受影响对象统计（simple-json）
+  @Column('simple-json', { nullable: true })
+  affected: {
+    trips: string[];             // 受影响班次号
+    onboardTicketIds: number[];  // 在途车辆上已检票车票
+    queuedTicketIds: number[];   // 站点排队车票
+    uncheckedTicketIds: number[];// 未检票有效车票
+    vehicleIds: number[];
+    driverIds: number[];
+  } | null;
+  @Column({ default: '' }) serviceScript: string;      // 客服统一口径
+}
+
+/** 停运期间司机收车记录（调度中心登记） */
+@Entity('storm_return_logs')
+export class StormReturnLog {
+  @PrimaryGeneratedColumn() id: number;
+  @Column() suspensionId: number;
+  @Column() tripId: number;
+  @Column() vehicleId: number;
+  @Column() driverId: number;
+  @Column({ default: '' }) returnStation: string;      // 就近停靠点
+  @Column('int', { default: 0 }) onboardPeople: number; // 收车时在车人数
+  @Column({ default: '' }) note: string;
+  @Column() createdAt: string;
+}
+
+/** 停运后车辆充电安排（调度中心登记） */
+@Entity('storm_charge_plans')
+export class StormChargePlan {
+  @PrimaryGeneratedColumn() id: number;
+  @Column() suspensionId: number;
+  @Column() vehicleId: number;
+  @Column({ default: 'planned' }) status: 'planned' | 'charging' | 'done';
+  @Column('int', { default: 100 }) targetBattery: number;
+  @Column({ nullable: true }) plannedAt: string | null;
+  @Column({ default: '' }) slot: string;               // 充电车位/桩位
+  @Column({ default: '' }) note: string;
+  @Column() createdAt: string;
+  @Column({ nullable: true }) finishedAt: string | null;
+}
+
 export const ALL_ENTITIES = [
   RouteLine, Station, Vehicle, Driver, SafetyCheck, Trip, Ticket, QueueEntry,
   Incident, Refund, Broadcast, Weather, RoadControl, GeofenceEvent, CharterOrder,
+  StormSuspension, StormReturnLog, StormChargePlan,
 ];

@@ -1,0 +1,53 @@
+# 一键启动：docker compose up --build
+# 前端 http://localhost:8080 ；后端 API http://localhost:3001/api
+services:
+  server:
+    build:
+      context: ./server
+    container_name: scenic-shuttle-server
+    environment:
+      # 默认 SQLite，零外部依赖；数据持久化到 named volume
+      SQLITE_PATH: /app/data/app.sqlite
+      PORT: 3001
+      # 如需 MySQL，取消下面注释并改用 mysql 服务（见文末）
+      # DB_TYPE: mysql
+      # DB_HOST: mysql
+      # DB_PORT: 3306
+      # DB_USER: root
+      # DB_PASSWORD: root
+      # DB_NAME: scenic_shuttle
+    ports:
+      - "3001:3001"
+    volumes:
+      - server-data:/app/data
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+    container_name: scenic-shuttle-web
+    depends_on:
+      - server
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+volumes:
+  server-data:
+
+# ---- 可选 MySQL（默认不启用）----
+#  mysql:
+#    image: mysql:8.4
+#    container_name: scenic-shuttle-mysql
+#    environment:
+#      MYSQL_ROOT_PASSWORD: root
+#      MYSQL_DATABASE: scenic_shuttle
+#    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+#    ports:
+#      - "3306:3306"
+#    volumes:
+#      - mysql-data:/var/lib/mysql
+#
+# volumes:
+#   server-data:
+#   mysql-data:

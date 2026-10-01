@@ -1,10 +1,16 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { Ticket, Refund, QueueEntry, Station, Incident } from '../entities';
+import { Ticket, Refund, QueueEntry, Station, Incident, StormSuspension } from '../entities';
 import { BuyTicketDto, RefundRequestDto } from './dto';
 import { IncidentsService } from '../incidents/incidents.service';
-import { now, seqCode, ticketPrice, waitSeconds } from '../common';
+import {
+  now, seqCode, ticketPrice, waitSeconds,
+  stormRefundAmount, stormChangeAmounts, nextDayDate,
+  STORM_POLICY,
+} from '../common';
+
+export type StormOption = 'transfer' | 'postpone' | 'refund';
 
 @Injectable()
 export class TicketsService {
@@ -13,6 +19,7 @@ export class TicketsService {
     @InjectRepository(Refund) private readonly refunds: Repository<Refund>,
     @InjectRepository(QueueEntry) private readonly queue: Repository<QueueEntry>,
     @InjectRepository(Station) private readonly stations: Repository<Station>,
+    @InjectRepository(StormSuspension) private readonly suspensions: Repository<StormSuspension>,
     private readonly incidents: IncidentsService,
   ) {}
 
@@ -92,6 +99,15 @@ export class TicketsService {
       refunds,
       incidents: incs,
       typeLabel: this.typeName(ticket.type),
+      storm: ticket.stormLocked ? {
+        category: ticket.stormCategory,
+        categoryLabel: ({ onboard: '在途车辆', queued: '站点排队', unchecked: '未检票订单' } as Record<string, string>)[ticket.stormCategory] || ticket.stormCategory,
+        option: ticket.stormOption,
+        optionAt: ticket.stormOptionAt,
+        postponeDate: ticket.postponeDate,
+        suspensionId: ticket.suspensionId,
+        finance: this.stormFinance(ticket),
+      } : null,
       currentWaitSeconds: queueEntries.length
         ? waitSeconds(queueEntries[queueEntries.length - 1].enqueueAt)
         : 0,
@@ -108,6 +124,9 @@ export class TicketsService {
   async requestRefund(ticketId: number, dto: RefundRequestDto) {
     const ticket = await this.tickets.findOne({ where: { id: ticketId } });
     if (!ticket) throw new NotFoundException('车票不存在');
+    if (ticket.stormLocked && ticket.stormOption !== 'refund') {
+      throw new BadRequestException('车票在暴雨停运锁定中，请通过「改乘 / 延期 / 退票」停运通道处理');
+    }
     if (['boarded', 'used'].includes(ticket.status)) {
       throw new BadRequestException('已检票上车的车票请走客服争议退票');
     }
@@ -151,6 +170,144 @@ export class TicketsService {
     const tickets = await this.tickets.find();
     const ticketMap = new Map(tickets.map(t => [t.id, t]));
     return rows.map(r => ({ ...r, ticket: ticketMap.get(r.ticketId) }));
+  }
+
+  /* ================= 暴雨临时停运：游客三选一 ================= */
+
+  /** 停运车票按票种生成的改期/退票金额（游客页、客服、财务共用口径） */
+  stormFinance(ticket: Ticket) {
+    const refund = stormRefundAmount(ticket.type, ticket.partySize);
+    const transfer = stormChangeAmounts(ticket.type, ticket.partySize, 'transfer');
+    const postpone = stormChangeAmounts(ticket.type, ticket.partySize, 'postpone');
+    return {
+      policy: STORM_POLICY[ticket.type] || STORM_POLICY.single,
+      refundAmount: refund,
+      transfer: { fee: transfer.fee, carriedAmount: transfer.carriedAmount },
+      postpone: { fee: postpone.fee, carriedAmount: postpone.carriedAmount },
+    };
+  }
+
+  /**
+   * 游客对被停运锁定的车票三选一：改乘 / 延期 / 退票
+   * - 改乘：生成改乘单（免手续费、原票款结转），恢复后优先安排接驳/首班
+   * - 延期：登记改期日期，票款结转，队列标记延期
+   * - 退票：按票种生成全额退票单，客服核准 → 财务确认 → 归档
+   */
+  async stormChoose(ticketId: number, option: StormOption, body: { postponeDate?: string } = {}) {
+    const ticket = await this.tickets.findOne({ where: { id: ticketId } });
+    if (!ticket) throw new NotFoundException('车票不存在');
+    if (!ticket.stormLocked || !ticket.suspensionId) {
+      throw new BadRequestException('该票未处于暴雨停运锁定状态');
+    }
+    if (ticket.stormOption) throw new BadRequestException('该票已做出停运选择，不能重复选择');
+    const suspension = await this.suspensions.findOne({ where: { id: ticket.suspensionId } });
+    if (!suspension) throw new NotFoundException('停运单不存在');
+
+    ticket.stormOption = option;
+    ticket.stormOptionAt = now();
+
+    const fin = this.stormFinance(ticket);
+    const categoryLabel = ({ onboard: '在途', queued: '排队', unchecked: '未检票' } as Record<string, string>)[ticket.stormCategory] || '';
+
+    if (option === 'refund') {
+      const amount = fin.refundAmount;
+      const refund = await this.refunds.save(this.refunds.create({
+        code: seqCode('RF'),
+        ticketId: ticket.id,
+        kind: 'refund',
+        amount,
+        carriedAmount: 0,
+        reason: `${suspension.warning}临时停运（${categoryLabel}车票），游客选择全额退票`,
+        faultTag: 'storm',
+        applicantRole: 'visitor',
+        status: 'pending',
+        suspensionId: suspension.id,
+        createdAt: now(),
+      }));
+      ticket.status = 'refund_pending';
+      await this.tickets.save(ticket);
+      const inc = await this.incidents.create({
+        type: 'refund_request', severity: 'critical',
+        title: `暴雨停运退票：${ticket.visitorName}（¥${(amount / 100).toFixed(2)}）`,
+        detail: `${this.typeName(ticket.type)} × ${ticket.partySize} 人，按票种全额 ¥${(amount / 100).toFixed(2)}；停运无责免手续费，等待客服核准`,
+        ticketId, refundId: refund.id, tripId: ticket.tripId,
+        raisedByRole: 'visitor', ownerRole: 'service', status: 'open',
+        firstNote: `游客在停运三选一中选择退票（${categoryLabel}）`,
+      });
+      return { option, refund, incident: inc, finance: fin };
+    }
+
+    if (option === 'postpone') {
+      const date = body.postponeDate || nextDayDate();
+      ticket.postponeDate = date;
+      // 排队票：队列标记为延期；未检票/在途/被驳回票回到有效状态，改期日乘车
+      const entry = await this.queue.findOne({
+        where: { ticketId: ticket.id, status: 'storm_locked' },
+      });
+      if (entry) { entry.status = 'storm_postponed'; await this.queue.save(entry); }
+      ticket.status = 'valid';
+      await this.tickets.save(ticket);
+      const change = await this.refunds.save(this.refunds.create({
+        code: seqCode('RF'),
+        ticketId: ticket.id,
+        kind: 'postpone',
+        amount: fin.postpone.fee,
+        carriedAmount: fin.postpone.carriedAmount,
+        reason: `${suspension.warning}临时停运，游客选择延期至 ${date}（免手续费，票款结转）`,
+        faultTag: 'storm',
+        applicantRole: 'visitor',
+        status: 'approved', // 改期单无资金流出，客服口径直接确认，财务备案
+        suspensionId: suspension.id,
+        serviceNote: '暴雨停运延期：免手续费，原票款结转，优先/轮椅资格保留',
+        processedAt: now(),
+        createdAt: now(),
+      }));
+      const inc = await this.incidents.create({
+        type: 'storm_suspension', severity: 'warn',
+        title: `暴雨停运延期：${ticket.visitorName} 改期至 ${date}`,
+        detail: `${this.typeName(ticket.type)} × ${ticket.partySize} 人；手续费 ¥0，原票款 ¥${(fin.postpone.carriedAmount / 100).toFixed(2)} 结转`,
+        ticketId, refundId: change.id, tripId: ticket.tripId,
+        raisedByRole: 'visitor', ownerRole: 'service', status: 'processing',
+        firstNote: `游客选择延期（${categoryLabel}），改期日 ${date} 优先安排`,
+      });
+      return { option, change, incident: inc, finance: fin, postponeDate: date };
+    }
+
+    // transfer 改乘
+    const entry = await this.queue.findOne({
+      where: { ticketId: ticket.id, status: 'storm_locked' },
+    });
+    if (entry) {
+      // 排队游客：保留顺位，恢复后按原顺位优先改乘首班 → 回到 waiting
+      entry.status = 'waiting';
+      await this.queue.save(entry);
+    }
+    if (ticket.status === 'boarded') ticket.status = 'valid'; // 在途改乘：回到待乘，由接驳/首班承载
+    await this.tickets.save(ticket);
+    const change = await this.refunds.save(this.refunds.create({
+      code: seqCode('RF'),
+      ticketId: ticket.id,
+      kind: 'transfer',
+      amount: fin.transfer.fee,
+      carriedAmount: fin.transfer.carriedAmount,
+      reason: `${suspension.warning}临时停运，游客选择改乘（恢复后首班/接驳车，免手续费，票款结转）`,
+      faultTag: 'storm',
+      applicantRole: 'visitor',
+      status: 'approved',
+      suspensionId: suspension.id,
+      serviceNote: '暴雨停运改乘：免手续费，原票款结转，排队顺位保留',
+      processedAt: now(),
+      createdAt: now(),
+    }));
+    const inc = await this.incidents.create({
+      type: 'storm_suspension', severity: 'warn',
+      title: `暴雨停运改乘：${ticket.visitorName} 等候接驳/恢复后首班`,
+      detail: `${this.typeName(ticket.type)} × ${ticket.partySize} 人；手续费 ¥0，原票款 ¥${(fin.transfer.carriedAmount / 100).toFixed(2)} 结转，排队顺位保留`,
+      ticketId, refundId: change.id, tripId: ticket.tripId,
+      raisedByRole: 'visitor', ownerRole: 'service', status: 'processing',
+      firstNote: `游客选择改乘（${categoryLabel}），恢复运营后优先安排`,
+    });
+    return { option, change, incident: inc, finance: fin };
   }
 
   private typeName(t: string) {

@@ -3,7 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import {
   Station, RouteLine, QueueEntry, Ticket, Trip, Vehicle, Weather,
-  Broadcast, RoadControl, Incident,
+  Broadcast, RoadControl, Incident, StormSuspension,
 } from '../entities';
 import { IncidentsService } from '../incidents/incidents.service';
 import { now, waitSeconds } from '../common';
@@ -23,6 +23,7 @@ export class StationsService {
     @InjectRepository(Broadcast) private readonly broadcasts: Repository<Broadcast>,
     @InjectRepository(RoadControl) private readonly controls: Repository<RoadControl>,
     @InjectRepository(Incident) private readonly incidents: Repository<Incident>,
+    @InjectRepository(StormSuspension) private readonly suspensions: Repository<StormSuspension>,
     private readonly incidentSvc: IncidentsService,
   ) {}
 
@@ -128,12 +129,27 @@ export class StationsService {
       where: { stationId, status: 'boarded' },
     });
 
+    // 暴雨停运期间被锁定的本站队列（保留顺位，不可检票）
+    const stormLockedEntries = await this.queue.find({
+      where: { stationId, status: In(['storm_locked', 'storm_postponed']) },
+      order: { id: 'ASC' },
+    });
+    const stormLockedRows = await this.tickets.find({
+      where: { id: In(stormLockedEntries.map(e => e.ticketId)) },
+    });
+    const stormTicketMap = new Map(stormLockedRows.map(t => [t.id, t]));
+    const stormLockedQueue = stormLockedEntries.map(e => ({
+      ...e, ticket: stormTicketMap.get(e.ticketId),
+    }));
+
     return {
       station,
       route,
       weather: weatherRow || null,
       controls,
+      stormActive: await this.suspensions.findOne({ where: { status: 'active' } }),
       queue,
+      stormLockedQueue,
       waitingPeople,
       priorityPeople,
       congestion: this.congestionLevel(station, waitingPeople),
@@ -150,6 +166,8 @@ export class StationsService {
     const station = await this.stations.findOne({ where: { id: stationId } });
     if (!station) throw new NotFoundException('站点不存在');
     if (station.status === 'closed') throw new BadRequestException('该站点已关闭');
+    const suspension = await this.suspensions.findOne({ where: { status: 'active' } });
+    if (suspension) throw new BadRequestException('暴雨临时停运中，全线暂停排队检票，请按客服口径引导游客改乘/延期/退票');
     const ticket = await this.tickets.findOne({ where: { code: ticketCode.trim() } });
     if (!ticket) throw new NotFoundException('车票号无效');
     if (ticket.originStationId !== stationId) {
@@ -212,11 +230,20 @@ export class StationsService {
   async boardEntry(entryId: number, tripId: number, opts: { force?: boolean } = {}) {
     const entry = await this.queue.findOne({ where: { id: entryId } });
     if (!entry) throw new NotFoundException('排队记录不存在');
+    if (entry.status === 'storm_locked') {
+      throw new BadRequestException('暴雨临时停运锁定中，停止检票；请引导游客完成改乘/延期/退票');
+    }
+    if (entry.status === 'storm_postponed') {
+      throw new BadRequestException('该游客已选择延期，按登记改期日乘车');
+    }
     if (!['waiting', 'called'].includes(entry.status)) {
       throw new BadRequestException('该游客已不在候乘状态');
     }
     const ticket = await this.tickets.findOne({ where: { id: entry.ticketId } });
     if (!ticket) throw new NotFoundException('车票不存在');
+    if (ticket.stormLocked) {
+      throw new BadRequestException('该票在暴雨停运锁定中，待游客完成改乘/延期/退票处理');
+    }
     const trip = await this.trips.findOne({ where: { id: tripId } });
     if (!trip) throw new NotFoundException('班次不存在');
     if (!['boarding', 'running'].includes(trip.status)) {

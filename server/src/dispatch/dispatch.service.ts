@@ -3,7 +3,8 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { In, Not, Repository } from 'typeorm';
 import {
   Vehicle, Driver, Trip, Ticket, QueueEntry, Station, RouteLine, Weather,
-  RoadControl, GeofenceEvent, SafetyCheck, CharterOrder,
+  RoadControl, GeofenceEvent, SafetyCheck, CharterOrder, Incident, Refund,
+  Broadcast, StormSuspension, StormReturnLog, StormChargePlan,
 } from '../entities';
 import { IncidentsService } from '../incidents/incidents.service';
 import { now, seqCode, waitSeconds } from '../common';
@@ -29,6 +30,11 @@ export class DispatchService {
     @InjectRepository(GeofenceEvent) private readonly geofence: Repository<GeofenceEvent>,
     @InjectRepository(SafetyCheck) private readonly checks: Repository<SafetyCheck>,
     @InjectRepository(CharterOrder) private readonly charters: Repository<CharterOrder>,
+    @InjectRepository(Refund) private readonly refunds: Repository<Refund>,
+    @InjectRepository(Broadcast) private readonly broadcasts: Repository<Broadcast>,
+    @InjectRepository(StormSuspension) private readonly suspensions: Repository<StormSuspension>,
+    @InjectRepository(StormReturnLog) private readonly returnLogs: Repository<StormReturnLog>,
+    @InjectRepository(StormChargePlan) private readonly chargePlans: Repository<StormChargePlan>,
     private readonly incidentSvc: IncidentsService,
   ) {}
 
@@ -73,6 +79,7 @@ export class DispatchService {
       trips: await this.decorateTrips(trips),
       charters,
       suggestions,
+      stormActive: await this.suspensions.findOne({ where: { status: 'active' } }),
     };
   }
 
@@ -106,7 +113,8 @@ export class DispatchService {
       out.push({ level: 'critical', text: `${weather.warning}，全线暂停发车，在班车就近折返/停运` });
     }
     for (const c of controls) {
-      out.push({ level: c.reason.includes('封闭') ? 'critical' : 'warn', text: `道路管制：${c.segment}（${c.reason}），派班需绕行或改区间` });
+      const closed = c.reason.includes('封闭') && !c.reason.includes('未封闭');
+      out.push({ level: closed ? 'critical' : 'warn', text: `道路管制：${c.segment}（${c.reason}），派班需绕行或改区间` });
     }
     return out;
   }
@@ -207,6 +215,9 @@ export class DispatchService {
     const v = await this.vehicles.findOne({ where: { id: vehicleId } });
     if (!v) throw new NotFoundException('车辆不存在');
     if (v.status === 'running') throw new BadRequestException('在运车辆不能直接充电');
+    if (v.stormReturnPending) {
+      throw new BadRequestException('暴雨停运待收车车辆，请先在“停运处置”中登记司机收车，再安排充电');
+    }
     v.status = 'charging';
     v.battery = Math.min(100, target);
     if (v.battery >= 100) v.status = 'idle';
@@ -312,14 +323,19 @@ export class DispatchService {
     const check = await this.todayPassedCheck(v.id, d.id);
     if (!check) blockers.push('司机今日对该车的发车前安全检查未完成或未通过');
 
+    const isClosed = (reason: string) => reason.includes('封闭') && !reason.includes('未封闭');
     const activeControls = await this.controls.find({ where: { status: 'active' } });
     const blockingControl = activeControls.find(c =>
-      c.reason.includes('封闭') && (!c.stationId || c.stationId === origin.id || c.stationId === dest.id));
+      isClosed(c.reason) && (!c.stationId || c.stationId === origin.id || c.stationId === dest.id));
     if (blockingControl) blockers.push(`道路管制：${blockingControl.segment} 道路封闭`);
 
     const [weatherRow] = await this.weatherRepo.find({ order: { id: 'DESC' }, take: 1 });
     if (weatherRow && weatherRow.warningLevel >= STORM_LEVEL) {
       blockers.push(`${weatherRow.warning}，按预案暂停发车`);
+    }
+    const activeSuspension = await this.suspensions.findOne({ where: { status: 'active' } });
+    if (activeSuspension) {
+      blockers.push(`暴雨停运单 ${activeSuspension.code} 生效中，全线锁定，恢复运营后方可派班`);
     }
     if (blockers.length) throw new BadRequestException(blockers.join('；'));
 
@@ -552,68 +568,372 @@ export class DispatchService {
 
   /* ================= 暴雨临时停运 ================= */
 
+  /** 停运期间在途/排队/未检票三类车票分别处理的统一客服口径 */
+  private buildServiceScript(warning: string, counts: {
+    onboard: number; queued: number; unchecked: number; trips: number;
+  }) {
+    return [
+      `【${warning}临时停运·客服统一口径】`,
+      `1. 在途车辆（${counts.trips} 班/在车 ${counts.onboard} 人）：由司机就近安全停靠，游客接驳避雨，车票已锁定，可在“改乘接驳车 / 延期 / 全额退票”中三选一。`,
+      `2. 站点排队（${counts.queued} 组）：停止检票与叫号，队列已锁定保留顺位，游客可改乘恢复后首班、延期或全额退票；不退队的游客恢复后优先按原顺位乘车。`,
+      `3. 未检票订单（${counts.unchecked} 张）：未入队车票已锁定，当日可免费改乘/改期，或申请全额退票，退票款项 1-3 个工作日原路退回。`,
+      '4. 所有选项均为景区责任，免手续费；退票由客服核准、财务确认出账后统一归档。请各渠道按此口径答复，不做超口径承诺。',
+    ].join('\n');
+  }
+
+  /**
+   * 一键暴雨临时停运：
+   * 锁定受影响车票（在途/站点排队/未检票三类分别标记）、锁定排队、中断班次，
+   * 在途车辆置为待收车（不自动复位），推送客服统一口径与全线广播。
+   */
   async stormSuspend(reason: string, routeId?: number) {
     const weather = (await this.weatherRepo.find({ order: { id: 'DESC' }, take: 1 }))[0];
     const label = weather?.warning || '暴雨';
+    const active = await this.suspensions.findOne({ where: { status: 'active' } });
+    if (active) throw new BadRequestException(`已存在进行中的停运单 ${active.code}，请先恢复运营`);
+
     const qb = this.trips.createQueryBuilder('t')
       .where('t.status IN (:...s)', { s: ['scheduled', 'boarding', 'running', 'delayed'] });
     if (routeId) qb.andWhere('t.routeId = :r', { r: routeId });
     const activeTrips = await qb.getMany();
 
+    const affected = {
+      trips: activeTrips.map(t => t.code),
+      onboardTicketIds: [] as number[],
+      queuedTicketIds: [] as number[],
+      uncheckedTicketIds: [] as number[],
+      vehicleIds: [...new Set(activeTrips.map(t => t.vehicleId))],
+      driverIds: [...new Set(activeTrips.map(t => t.driverId))],
+    };
+    const routeIds = routeId ? [routeId] : (await this.routes.find()).map(r => r.id);
+    const routeStations = await this.stations.find({ where: { routeId: In(routeIds) } });
+    const stationIds = routeStations.map(s => s.id);
+
+    const suspension = await this.suspensions.save(this.suspensions.create({
+      code: seqCode('SS'),
+      routeId: routeId || null,
+      warning: label,
+      reason,
+      status: 'active',
+      startedAt: now(),
+      affected: null,
+      serviceScript: '',
+    }));
+
+    // —— 第一类：在途车辆上的已检票车票（onboard）——
     for (const t of activeTrips) {
       t.status = 'suspended';
       t.suspendReason = `${label}临时停运：${reason}`;
+      t.suspensionId = suspension.id;
+      t.stormReturned = false;
       await this.trips.save(t);
 
-      // 已检票游客 → 自动生成停运退票单（客服批量复核、财务付款）
       const onboard = await this.tickets.find({ where: { tripId: t.id, status: 'boarded' } });
       for (const tk of onboard) {
+        tk.stormLocked = true;
+        tk.suspensionId = suspension.id;
+        tk.stormCategory = 'onboard';
+        await this.tickets.save(tk);
+        affected.onboardTicketIds.push(tk.id);
         await this.incidentSvc.create({
           type: 'storm_suspension', severity: 'critical',
-          title: `${label}停运：${tk.visitorName} 所乘 ${t.code} 中断`,
-          detail: `已上车游客由站点接驳避雨，票款走无责退票（客服复核 → 财务退款）`,
-          ticketId: tk.id, tripId: t.id,
+          title: `${label}停运·在途：${tk.visitorName} 所乘 ${t.code} 中断`,
+          detail: `车辆就近停靠、游客接驳避雨；车票已锁定，请游客在改乘/延期/退票中选择，票款按票种全额保障`,
+          ticketId: tk.id, tripId: t.id, vehicleId: t.vehicleId,
           raisedByRole: 'dispatch', ownerRole: 'service',
-          firstNote: `调度宣布停运：${reason}`,
+          firstNote: `调度宣布停运：${reason}；在途车辆等待司机收车登记`,
         });
       }
-      // 站台候乘游客 → 退回排队前状态，引导退票
-      const stations = await this.stations.find({ where: { routeId: t.routeId } });
-      const stationIds = stations.map(s => s.id);
-      const waitingEntries = await this.queue.find({
-        where: { stationId: In(stationIds), status: In(['waiting', 'called', 'skipped']) },
-      });
-      for (const e of waitingEntries) {
-        e.status = 'transferred';
-        await this.queue.save(e);
-        const tk = await this.tickets.findOne({ where: { id: e.ticketId } });
-        if (tk && ['queued', 'valid'].includes(tk.status)) {
-          tk.status = 'valid';
-          await this.tickets.save(tk);
-        }
-      }
 
+      // 在途车辆：锁定为待收车，保留位置，等待调度登记司机收车与充电安排
       const v = await this.vehicles.findOne({ where: { id: t.vehicleId } });
-      if (v) { v.status = 'idle'; v.currentTripId = null; await this.vehicles.save(v); }
-      const d = await this.drivers.findOne({ where: { id: t.driverId } });
-      if (d) { d.status = 'on_duty'; d.currentVehicleId = null; await this.drivers.save(d); }
-
-      await this.incidentSvc.create({
-        type: 'storm_suspension', severity: 'critical',
-        title: `${label}临时停运：${t.code}`,
-        detail: `${reason}｜在班车就近停靠，候乘游客 ${waitingEntries.length} 组已引导离队（可改签/退票）`,
-        tripId: t.id, vehicleId: t.vehicleId,
-        raisedByRole: 'dispatch', ownerRole: 'dispatch',
-        firstNote: '调度中心启动暴雨停运预案',
-      });
+      if (v) {
+        v.status = 'returning';
+        v.stormReturnPending = true;
+        await this.vehicles.save(v);
+      }
     }
-    return { suspendedTrips: activeTrips.map(t => t.code) };
+
+    // —— 第二类：站点排队（queued），停止检票/叫号，锁定队列与顺位 ——
+    const waitingEntries = await this.queue.find({
+      where: { stationId: In(stationIds), status: In(['waiting', 'called', 'skipped']) },
+    });
+    for (const e of waitingEntries) {
+      e.status = 'storm_locked';
+      e.suspensionId = suspension.id;
+      await this.queue.save(e);
+      const tk = await this.tickets.findOne({ where: { id: e.ticketId } });
+      if (tk && !tk.stormLocked) {
+        tk.stormLocked = true;
+        tk.suspensionId = suspension.id;
+        tk.stormCategory = 'queued';
+        tk.status = 'queued'; // 保留排队状态但被锁，检票/退票入口校验 stormLocked
+        await this.tickets.save(tk);
+        affected.queuedTicketIds.push(tk.id);
+      }
+    }
+
+    // —— 第三类：未检票有效订单（unchecked）：未入队/已离队的有效票 ——
+    const unchecked = await this.tickets.find({
+      where: { status: In(['valid', 'queued']) },
+    });
+    for (const tk of unchecked) {
+      if (tk.stormLocked) continue;
+      const origin = await this.stations.findOne({ where: { id: tk.originStationId } });
+      if (!origin || !routeIds.includes(origin.routeId)) continue;
+      tk.stormLocked = true;
+      tk.suspensionId = suspension.id;
+      tk.stormCategory = 'unchecked';
+      await this.tickets.save(tk);
+      affected.uncheckedTicketIds.push(tk.id);
+    }
+
+    suspension.affected = affected;
+    suspension.serviceScript = this.buildServiceScript(label, {
+      trips: activeTrips.length,
+      onboard: affected.onboardTicketIds.length,
+      queued: affected.queuedTicketIds.length,
+      unchecked: affected.uncheckedTicketIds.length,
+    });
+    await this.suspensions.save(suspension);
+
+    // 全线广播
+    await this.broadcasts.save(this.broadcasts.create({
+      stationId: 0,
+      content: `【${label}临时停运】因${reason}，观光车全线暂停运营：在途车辆就近停靠接驳，站点停止检票；请游客在工作人员指引下选择改乘、延期或全额退票，详询客服。`,
+      spokenByRole: 'dispatch', createdAt: now(),
+    }));
+
+    // 汇总事件（客服接单，按统一口径答复）
+    await this.incidentSvc.create({
+      type: 'storm_suspension', severity: 'critical',
+      title: `${label}临时停运：${activeTrips.length} 班中断，三类车票已锁定`,
+      detail: `在途 ${affected.onboardTicketIds.length} 张、排队 ${affected.queuedTicketIds.length} 张、未检票 ${affected.uncheckedTicketIds.length} 张；车辆待收车 ${affected.vehicleIds.length} 辆。客服按统一口径处理改乘/延期/退票`,
+      raisedByRole: 'dispatch', ownerRole: 'service',
+      firstNote: '调度中心启动暴雨停运预案，客服统一口径已同步',
+    });
+
+    return suspension;
   }
 
-  /** 停运恢复（预警解除），允许重新派班 */
-  async resumeOperation() {
-    const suspended = await this.trips.find({ where: { status: 'suspended' } });
-    return { ok: true, note: '预警已解除，可重新派班', suspendedStillOpen: suspended.length };
+  /** 停运看板汇总：进行中停运单 + 三类待处理车票 + 待收车车辆 + 充电安排 */
+  async stormOverview() {
+    const active = await this.suspensions.findOne({
+      where: { status: 'active' }, order: { id: 'DESC' },
+    });
+    const history = await this.suspensions.find({ order: { id: 'DESC' }, take: 10 });
+    if (!active) {
+      return { active: null, history, pending: { onboard: 0, queued: 0, unchecked: 0 } };
+    }
+    const [lockedTickets, returnLogs, chargePlans, returningVehicles, suspendedTrips] = await Promise.all([
+      this.tickets.find({ where: { suspensionId: active.id, stormLocked: true } }),
+      this.returnLogs.find({ where: { suspensionId: active.id } }),
+      this.chargePlans.find({ where: { suspensionId: active.id } }),
+      this.vehicles.find({ where: { stormReturnPending: true } }),
+      this.trips.find({ where: { suspensionId: active.id } }),
+    ]);
+    const pendingOption = lockedTickets.filter(t => !t.stormOption);
+    const [vehicles, drivers, trips] = await Promise.all([
+      this.vehicles.find(), this.drivers.find(), this.trips.find(),
+    ]);
+    const enrichVehicle = (vId: number) => vehicles.find(v => v.id === vId);
+    const returnView = returnLogs.map(l => ({
+      ...l,
+      vehicleCode: enrichVehicle(l.vehicleId)?.code,
+      driverName: drivers.find(d => d.id === l.driverId)?.name,
+      tripCode: trips.find(t => t.id === l.tripId)?.code,
+    }));
+    const chargeView = chargePlans.map(p => ({
+      ...p,
+      vehicleCode: enrichVehicle(p.vehicleId)?.code,
+      battery: enrichVehicle(p.vehicleId)?.battery,
+      vehicleStatus: enrichVehicle(p.vehicleId)?.status,
+    }));
+    return {
+      active,
+      history,
+      suspendedTrips,
+      pendingReturnVehicles: returningVehicles.map(v => {
+        const suspendedTrip = suspendedTrips.find(t => t.vehicleId === v.id && !t.stormReturned);
+        const driver = drivers.find(d => d.currentVehicleId === v.id)
+          || drivers.find(d => suspendedTrip?.driverId === d.id);
+        return {
+          ...v,
+          driverId: driver?.id || suspendedTrip?.driverId || null,
+          driverName: driver?.name,
+          tripCode: suspendedTrip?.code,
+          tripId: suspendedTrip?.id,
+        };
+      }),
+      returnLogs: returnView,
+      chargePlans: chargeView,
+      lockedCount: lockedTickets.length,
+      pending: {
+        onboard: pendingOption.filter(t => t.stormCategory === 'onboard').length,
+        queued: pendingOption.filter(t => t.stormCategory === 'queued').length,
+        unchecked: pendingOption.filter(t => t.stormCategory === 'unchecked').length,
+      },
+      optionStats: {
+        transfer: lockedTickets.filter(t => t.stormOption === 'transfer').length,
+        postpone: lockedTickets.filter(t => t.stormOption === 'postpone').length,
+        refund: lockedTickets.filter(t => t.stormOption === 'refund').length,
+      },
+    };
+  }
+
+  /** 调度登记司机收车：就近停靠点、在车人数、备注 */
+  async stormReturnVehicle(body: {
+    suspensionId: number; tripId?: number; vehicleId: number; driverId: number;
+    returnStation: string; onboardPeople: number; note?: string;
+  }) {
+    const s = await this.suspensions.findOne({ where: { id: body.suspensionId } });
+    if (!s) throw new NotFoundException('停运单不存在');
+    const v = await this.vehicles.findOne({ where: { id: body.vehicleId } });
+    if (!v) throw new NotFoundException('车辆不存在');
+    const exist = await this.returnLogs.findOne({
+      where: { suspensionId: s.id, vehicleId: v.id },
+    });
+    if (exist) throw new BadRequestException(`${v.code} 已登记收车`);
+
+    const trip = body.tripId
+      ? await this.trips.findOne({ where: { id: body.tripId } })
+      : await this.trips.findOne({
+        where: { suspensionId: s.id, vehicleId: v.id, stormReturned: false },
+      });
+    const log = await this.returnLogs.save(this.returnLogs.create({
+      suspensionId: s.id,
+      tripId: trip?.id || body.tripId || 0,
+      vehicleId: v.id, driverId: body.driverId,
+      returnStation: body.returnStation, onboardPeople: body.onboardPeople || 0,
+      note: body.note || '', createdAt: now(),
+    }));
+    if (trip) { trip.stormReturned = true; await this.trips.save(trip); }
+
+    // 车辆解除待收车 → 待命（是否充电由充电安排决定）；司机收车待命
+    v.stormReturnPending = false;
+    v.status = 'idle';
+    v.currentTripId = null;
+    await this.vehicles.save(v);
+    const d = await this.drivers.findOne({ where: { id: body.driverId } });
+    if (d) {
+      d.status = 'on_duty';
+      d.currentVehicleId = null;
+      await this.drivers.save(d);
+    }
+    await this.incidentSvc.create({
+      type: 'storm_suspension', severity: 'warn',
+      title: `${v.code} 司机${d?.name || ''}已收车（${body.returnStation}）`,
+      detail: `收车时在车 ${body.onboardPeople || 0} 人已接驳疏散；${body.note || '车辆等待充电安排'}`,
+      vehicleId: v.id, tripId: trip?.id,
+      raisedByRole: 'driver', ownerRole: 'dispatch', status: 'closed',
+      firstNote: `调度登记收车：停靠点 ${body.returnStation}`,
+    });
+    return log;
+  }
+
+  /** 登记车辆充电安排 */
+  async stormChargePlan(body: {
+    suspensionId: number; vehicleId: number; targetBattery?: number;
+    slot?: string; plannedAt?: string; note?: string;
+  }) {
+    const s = await this.suspensions.findOne({ where: { id: body.suspensionId } });
+    if (!s) throw new NotFoundException('停运单不存在');
+    const v = await this.vehicles.findOne({ where: { id: body.vehicleId } });
+    if (!v) throw new NotFoundException('车辆不存在');
+    if (v.stormReturnPending) throw new BadRequestException(`${v.code} 尚未登记收车，不能安排充电`);
+    const exist = await this.chargePlans.findOne({
+      where: { suspensionId: s.id, vehicleId: v.id, status: In(['planned', 'charging']) },
+    });
+    if (exist) throw new BadRequestException(`${v.code} 已有进行中的充电安排`);
+
+    const plan = await this.chargePlans.save(this.chargePlans.create({
+      suspensionId: s.id, vehicleId: v.id,
+      targetBattery: body.targetBattery || 100,
+      slot: body.slot || '', plannedAt: body.plannedAt || now(),
+      note: body.note || '', status: 'planned', createdAt: now(),
+    }));
+    v.status = 'charging';
+    await this.vehicles.save(v);
+    await this.incidentSvc.create({
+      type: 'info', severity: 'info',
+      title: `${v.code} 已安排暴雨停运后充电`,
+      detail: `桩位：${body.slot || '未指定'}，目标电量 ${body.targetBattery || 100}%，当前 ${v.battery}%`,
+      vehicleId: v.id, raisedByRole: 'dispatch', ownerRole: 'dispatch', status: 'closed',
+    });
+    return plan;
+  }
+
+  /** 充电安排状态推进（开始/完成） */
+  async stormChargeUpdate(id: number, status: 'charging' | 'done') {
+    const plan = await this.chargePlans.findOne({ where: { id } });
+    if (!plan) throw new NotFoundException('充电安排不存在');
+    plan.status = status;
+    if (status === 'done') {
+      plan.finishedAt = now();
+      const v = await this.vehicles.findOne({ where: { id: plan.vehicleId } });
+      if (v) {
+        v.battery = plan.targetBattery;
+        v.status = 'idle';
+        await this.vehicles.save(v);
+      }
+    }
+    return this.chargePlans.save(plan);
+  }
+
+  /** 预警解除、恢复运营：解除未选择车票的锁定，可重新派班（已选退票/延期的不回滚） */
+  async resumeOperation(note?: string) {
+    const active = await this.suspensions.findOne({ where: { status: 'active' } });
+    if (!active) return { ok: true, note: '当前无进行中的停运单' };
+    active.status = 'resumed';
+    active.resumedAt = now();
+    active.resumeNote = note || '';
+    await this.suspensions.save(active);
+
+    // 仍未做选择的锁定票：解除锁定；已选改乘/延期的同步解锁以便恢复后乘车
+    const locked = await this.tickets.find({
+      where: { suspensionId: active.id, stormLocked: true },
+    });
+    let unlocked = 0;
+    for (const tk of locked) {
+      if (tk.stormOption === 'refund' && tk.status !== 'refund_rejected') {
+        continue; // 退票仍在客服/财务流程中，保持锁定
+      }
+      tk.stormLocked = false;
+      if (tk.stormCategory === 'unchecked' && tk.status === 'valid') tk.status = 'valid';
+      await this.tickets.save(tk);
+      unlocked++;
+    }
+    // 被锁队列：未选择者恢复排队顺位；改乘者已在选择时回队；延期者保留 storm_postponed
+    const lockedQueue = await this.queue.find({
+      where: { suspensionId: active.id, status: 'storm_locked' },
+    });
+    for (const e of lockedQueue) {
+      const tk = await this.tickets.findOne({ where: { id: e.ticketId } });
+      if (tk && tk.stormOption === 'refund' && tk.status === 'refund_pending') continue;
+      e.status = 'waiting';
+      await this.queue.save(e);
+    }
+    // 兜底：还有待收车车辆则释放为待命
+    const pending = await this.vehicles.find({ where: { stormReturnPending: true } });
+    for (const v of pending) { v.stormReturnPending = false; v.status = 'idle'; await this.vehicles.save(v); }
+
+    await this.broadcasts.save(this.broadcasts.create({
+      stationId: 0,
+      content: '【运营恢复】暴雨预警解除，观光车恢复运营；停运期间选择延期/改乘的游客可按登记信息乘车，退票游客款项将由财务统一出账。',
+      spokenByRole: 'dispatch', createdAt: now(),
+    }));
+    await this.incidentSvc.create({
+      type: 'storm_suspension', severity: 'info',
+      title: `暴雨停运单 ${active.code} 已恢复运营`,
+      detail: note || '预警解除，恢复派班与检票',
+      raisedByRole: 'dispatch', ownerRole: 'dispatch', status: 'closed',
+      firstNote: `调度恢复运营；未选择游客解锁 ${unlocked} 张`,
+    });
+    return { ok: true, suspensionCode: active.code, unlockedTickets: unlocked };
+  }
+
+  async listSuspensions() {
+    return this.suspensions.find({ order: { id: 'DESC' }, take: 20 });
   }
 
   /* ================= 天气 / 管制 ================= */

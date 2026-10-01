@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import {
   Card, Button, Tag, Space, Table, Select, Alert, Row, Col, Statistic, Modal,
-  Input, InputNumber, message, Tabs, Badge, Popconfirm, Typography,
+  Input, InputNumber, message, Tabs, Badge, Popconfirm, Typography, Empty,
 } from 'antd';
 import {
   CloudServerOutlined, ThunderboltOutlined, WarningOutlined,
@@ -19,12 +19,14 @@ export default function DispatchPage() {
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       <Space wrap>
         <Button onClick={refresh}>刷新看板</Button>
-        {dash?.weather?.warningLevel >= 3 ? (
-          <Popconfirm title="确认预警解除、恢复运营？" onConfirm={async () => {
-            await api.post('/dispatch/resume', {});
-            message.success('可重新派班');
-          }}>
-            <Button type="primary" ghost>运营恢复（仅解除派班限制，请同步更新天气）</Button>
+        {dash?.stormActive ? (
+          <Popconfirm title="确认预警解除、恢复运营？未选择游客将解锁并恢复排队顺位（退票流程中的票保持锁定）"
+            onConfirm={async () => {
+              const r = await api.post('/dispatch/resume', { note: '调度确认预警解除，踏勘完成' });
+              message.success(`停运单 ${r.suspensionCode} 已恢复，解锁车票 ${r.unlockedTickets} 张；记得同步更新天气`);
+              refresh();
+            }}>
+            <Button type="primary" ghost danger>恢复运营（停运单 {dash.stormActive.code}）</Button>
           </Popconfirm>
         ) : null}
       </Space>
@@ -65,6 +67,8 @@ export default function DispatchPage() {
         items={[
           { key: 'board', label: '站点与车辆', children: <BoardTab dash={dash} loading={loading} geo={geo} refresh={refresh} /> },
           { key: 'dispatch', label: '派班发车', children: <DispatchTab dash={dash} refresh={refresh} /> },
+          { key: 'storm', label: <Badge count={dash?.stormActive ? 1 : 0} size="small" offset={[6, -2]}>暴雨停运处置</Badge>,
+            children: <StormTab refresh={refresh} /> },
           { key: 'charter', label: '团队包车', children: <CharterTab dash={dash} refresh={refresh} /> },
           { key: 'weather', label: '天气与道路管制', children: <WeatherTab dash={dash} refresh={refresh} /> },
         ]}
@@ -136,8 +140,9 @@ function BoardTab({ dash, loading, geo, refresh }: any) {
               title: '状态', dataIndex: 'status',
               render: (s: string) => <Tag color={
                 s === 'breakdown' ? 'red' : s === 'maintenance' ? 'orange'
-                : s === 'running' ? 'blue' : s === 'charging' ? 'gold' : 'default'}>
-                {({ idle: '待命', running: '在运', charging: '充电中', maintenance: '维保', breakdown: '故障' } as any)[s]}
+                : s === 'running' ? 'blue' : s === 'returning' ? 'red'
+                : s === 'charging' ? 'gold' : 'default'}>
+                {({ idle: '待命', running: '在运', returning: '暴雨待收车', charging: '充电中', maintenance: '维保', breakdown: '故障' } as any)[s]}
               </Tag>,
             },
             { title: '包车预留', dataIndex: 'reservedForCharter', render: (v: boolean) => v ? <Tag color="purple">已预留</Tag> : '—' },
@@ -145,8 +150,9 @@ function BoardTab({ dash, loading, geo, refresh }: any) {
               title: '操作', key: 'op',
               render: (_: any, r: any) => (
                 <Space>
-                  {r.status !== 'charging' && r.status !== 'running' &&
+                  {r.status !== 'charging' && r.status !== 'running' && !r.stormReturnPending &&
                     <Button size="small" onClick={async () => { await api.post(`/vehicles/${r.id}/charge`, { target: 100 }); message.success('已充电至 100%，转待命'); refresh(); }}>充满电</Button>}
+                  {r.stormReturnPending && <Tag color="red">停运待收车（见「暴雨停运处置」）</Tag>}
                   {['breakdown', 'maintenance'].includes(r.status) &&
                     <Button size="small" type="primary" ghost onClick={async () => { await api.post(`/vehicles/${r.id}/repair`, {}); message.success('维修/复检通过，转待命'); refresh(); }}>修复复检</Button>}
                 </Space>
@@ -392,10 +398,11 @@ function WeatherTab({ dash, refresh }: any) {
         {level >= 3 && (
           <Alert style={{ marginTop: 12 }} type="error" showIcon
             message={`${warning || '高级别气象预警'}：可执行全线临时停运`}
-            action={<Popconfirm title="确认全线临时停运？在班车立即中断、候乘游客引导退票、已上车票自动转客服"
+            action={<Popconfirm title="确认全线临时停运？在途车辆待收车、站点队列与车票锁定，游客进入改乘/延期/退票通道"
               onConfirm={async () => {
                 const r = await api.post('/dispatch/storm-suspend', { reason: `${warning}，降雨量 ${rain}mm/h` });
-                message.success(`已停运 ${r.suspendedTrips.length} 个班次`);
+                const a = r.affected || {};
+                message.success(`停运单 ${r.code} 已生效：在途 ${a.onboardTicketIds?.length || 0}、排队 ${a.queuedTicketIds?.length || 0}、未检票 ${a.uncheckedTicketIds?.length || 0}，请到「暴雨停运处置」登记收车与充电`);
                 refresh();
               }}>
               <Button danger type="primary">一键临时停运</Button>
@@ -446,5 +453,195 @@ function AddControl({ stations, onDone }: { stations: any[]; onDone: () => void 
 }
 
 function vehicleStatus(s: string) {
-  return ({ idle: '待命', running: '在运', charging: '充电', maintenance: '维保', breakdown: '故障' } as any)[s] || s;
+  return ({ idle: '待命', running: '在运', returning: '待收车', charging: '充电', maintenance: '维保', breakdown: '故障' } as any)[s] || s;
+}
+
+/* ================= 暴雨临时停运处置 ================= */
+
+function StormTab({ refresh }: { refresh: () => void }) {
+  const [tick, setTick] = useState(0);
+  const { data: ov } = useApi<any>(`/dispatch/storm-overview?t=${tick}`, [tick]);
+  const reload = () => { setTick(t => t + 1); refresh(); };
+  const [returnFor, setReturnFor] = useState<any>(null);
+  const [chargeFor, setChargeFor] = useState<any>(null);
+
+  if (!ov?.active) {
+    return (
+      <Space direction="vertical" style={{ width: '100%' }}>
+        <Alert type="info" showIcon message="当前没有进行中的暴雨停运单"
+          description="在「天气与道路管制」中将预警等级调到 ≥3（橙色），即可一键启动全线临时停运。" />
+        <Card title="历史停运单">
+          <Table rowKey="id" size="small" pagination={false} dataSource={ov?.history || []}
+            columns={[
+              { title: '停运单', dataIndex: 'code' },
+              { title: '预警', dataIndex: 'warning' },
+              { title: '原因', dataIndex: 'reason' },
+              { title: '开始', dataIndex: 'startedAt', render: (v: string) => new Date(v).toLocaleString('zh-CN') },
+              { title: '状态', dataIndex: 'status', render: (s: string) =>
+                s === 'active' ? <Tag color="red">停运中</Tag> : <Tag color="green">已恢复</Tag> },
+            ]} />
+        </Card>
+      </Space>
+    );
+  }
+
+  const a = ov.active;
+  return (
+    <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Alert type="error" showIcon
+        message={<Space><b>停运单 {a.code} 生效中</b><Tag color="red">{a.warning}</Tag></Space>}
+        description={`${a.reason}｜开始 ${new Date(a.startedAt).toLocaleString('zh-CN')}｜派班、排队、检票均已锁定`}
+        action={<Popconfirm title="确认恢复运营？" onConfirm={async () => {
+          const r = await api.post('/dispatch/resume', { note: '预警解除，道路踏勘完成' });
+          message.success(`已恢复，解锁 ${r.unlockedTickets} 张票`); reload();
+        }}><Button danger type="primary">恢复运营</Button></Popconfirm>} />
+
+      <Row gutter={12}>
+        <Col xs={12} md={6}><Card><Statistic title="在途待选择" value={ov.pending.onboard} valueStyle={{ color: '#cf1322' }} suffix="张" /></Card></Col>
+        <Col xs={12} md={6}><Card><Statistic title="排队待选择" value={ov.pending.queued} valueStyle={{ color: '#d46b08' }} suffix="张" /></Card></Col>
+        <Col xs={12} md={6}><Card><Statistic title="未检票待选择" value={ov.pending.unchecked} suffix="张" /></Card></Col>
+        <Col xs={12} md={6}><Card><Statistic title="待收车车辆" value={ov.pendingReturnVehicles?.length || 0}
+          valueStyle={{ color: '#cf1322' }} suffix="辆" /></Card></Col>
+      </Row>
+
+      <Card title="游客选择进度（改乘 / 延期 / 退票）">
+        <Space size={32}>
+          <Statistic title="改乘" value={ov.optionStats.transfer} valueStyle={{ color: '#1677ff' }} />
+          <Statistic title="延期" value={ov.optionStats.postpone} valueStyle={{ color: '#722ed1' }} />
+          <Statistic title="退票" value={ov.optionStats.refund} valueStyle={{ color: '#cf1322' }} />
+          <Statistic title="已锁定总数" value={ov.lockedCount} />
+        </Space>
+      </Card>
+
+      <Card title="① 在途车辆·司机收车登记（停运后车辆就近停靠，登记后方可安排充电）">
+        <Table rowKey="id" size="small" pagination={false} dataSource={ov.pendingReturnVehicles || []}
+          locale={{ emptyText: <Empty description="全部在途车辆已完成收车登记" /> }}
+          columns={[
+            { title: '车号', dataIndex: 'code', width: 80 },
+            { title: '车牌', dataIndex: 'plate', width: 110 },
+            { title: '司机', key: 'd', render: (_: any, r: any) => r.driverName || '—' },
+            { title: '中断班次', key: 't', render: (_: any, r: any) => r.tripCode || '—' },
+            { title: '当前位置', dataIndex: 'currentStationId', render: (id: number) => `站点#${id}` },
+            { title: '操作', key: 'op', render: (_: any, r: any) =>
+              <Button size="small" type="primary" danger onClick={() => setReturnFor(r)}>登记司机收车</Button> },
+          ]} />
+      </Card>
+
+      <Card title="收车记录">
+        <Table rowKey="id" size="small" pagination={false} dataSource={ov.returnLogs || []}
+          columns={[
+            { title: '时间', dataIndex: 'createdAt', render: (v: string) => new Date(v).toLocaleTimeString('zh-CN') },
+            { title: '车辆', dataIndex: 'vehicleCode' },
+            { title: '司机', dataIndex: 'driverName' },
+            { title: '班次', dataIndex: 'tripCode' },
+            { title: '停靠点', dataIndex: 'returnStation' },
+            { title: '收车时在车人数', dataIndex: 'onboardPeople' },
+            { title: '备注', dataIndex: 'note' },
+          ]} />
+      </Card>
+
+      <Card title="② 车辆充电安排（收车登记后安排，完成后电量自动补满转待命）"
+        extra={<Button type="primary" disabled={!ov.returnLogs?.length}
+          onClick={() => setChargeFor(ov)}>新增充电安排</Button>}>
+        <Table rowKey="id" size="small" pagination={false} dataSource={ov.chargePlans || []}
+          columns={[
+            { title: '车辆', key: 'v', render: (_: any, r: any) =>
+              <Space>{r.vehicleCode}<Tag>{r.vehicleStatus === 'charging' ? '充电中' : r.vehicleStatus}</Tag></Space> },
+            { title: '桩位', dataIndex: 'slot', render: (v: string) => v || '—' },
+            { title: '当前电量', dataIndex: 'battery', render: (n: number) => `${n}%` },
+            { title: '目标电量', dataIndex: 'targetBattery', render: (n: number) => `${n}%` },
+            { title: '状态', dataIndex: 'status', render: (s: string) =>
+              <Tag color={s === 'done' ? 'green' : s === 'charging' ? 'blue' : 'orange'}>
+                {({ planned: '待充电', charging: '充电中', done: '已完成' } as any)[s]}</Tag> },
+            { title: '操作', key: 'op', render: (_: any, r: any) => (
+              <Space>
+                {r.status === 'planned' && <Button size="small" onClick={async () => {
+                  await api.post(`/dispatch/storm-charge-plan/${r.id}/status`, { status: 'charging' }); reload();
+                }}>开始充电</Button>}
+                {r.status === 'charging' && <Button size="small" type="primary" onClick={async () => {
+                  await api.post(`/dispatch/storm-charge-plan/${r.id}/status`, { status: 'done' });
+                  message.success(`${r.vehicleCode} 充电完成，已转待命`); reload();
+                }}>充电完成</Button>}
+              </Space>
+            ) },
+          ]} />
+      </Card>
+
+      <Card title="受影响班次">
+        <Table rowKey="id" size="small" pagination={false} dataSource={ov.suspendedTrips || []}
+          columns={[
+            { title: '班次', dataIndex: 'code' },
+            { title: '停运原因', dataIndex: 'suspendReason' },
+            { title: '收车', dataIndex: 'stormReturned', render: (v: boolean) =>
+              v ? <Tag color="green">已收车</Tag> : <Tag color="red">待收车</Tag> },
+          ]} />
+      </Card>
+
+      <Card title="客服统一口径（同步客服端，各渠道按此答复，不做超口径承诺）">
+        <Typography.Paragraph style={{ whiteSpace: 'pre-wrap', marginBottom: 0 }}>{a.serviceScript}</Typography.Paragraph>
+      </Card>
+
+      <ReturnModal suspensionId={a.id} vehicle={returnFor} onClose={() => setReturnFor(null)}
+        onDone={() => { setReturnFor(null); reload(); }} />
+      <ChargePlanModal suspensionId={a.id} ov={chargeFor} onClose={() => setChargeFor(null)}
+        onDone={() => { setChargeFor(null); reload(); }} />
+    </Space>
+  );
+}
+
+function ReturnModal({ suspensionId, vehicle, onClose, onDone }: any) {
+  const [station, setStation] = useState('就近避雨停靠点');
+  const [people, setPeople] = useState(2);
+  const [note, setNote] = useState('');
+  return (
+    <Modal open={!!vehicle} title={`登记司机收车：${vehicle?.code}（${vehicle?.tripCode || ''}）`}
+      onCancel={onClose}
+      onOk={async () => {
+        if (!vehicle?.driverId) return message.error('未找到该班次司机');
+        await api.post('/dispatch/storm-return', {
+          suspensionId, tripId: vehicle?.tripId, vehicleId: vehicle?.id,
+          driverId: vehicle.driverId, returnStation: station, onboardPeople: people, note,
+        });
+        message.success('收车已登记，可安排充电'); onDone();
+      }}>
+      <Space direction="vertical" style={{ width: '100%', marginTop: 8 }}>
+        <div className="muted">司机：{vehicle?.driverName || '—'}</div>
+        <Input addonBefore="停靠点" value={station} onChange={e => setStation(e.target.value)} />
+        <InputNumber addonBefore="收车时在车人数" min={0} value={people} onChange={v => setPeople(v || 0)} />
+        <Input.TextArea rows={2} placeholder="备注：如游客接驳疏散情况、车辆外观检查"
+          value={note} onChange={e => setNote(e.target.value)} />
+      </Space>
+    </Modal>
+  );
+}
+
+function ChargePlanModal({ suspensionId, ov, onClose, onDone }: any) {
+  const [vehicleId, setVehicleId] = useState<number>();
+  const [target, setTarget] = useState(100);
+  const [slot, setSlot] = useState('');
+  const [note, setNote] = useState('');
+  const returnedIds = new Set((ov?.returnLogs || []).map((l: any) => l.vehicleId));
+  const options = (ov?.returnLogs || [])
+    .map((l: any) => ({ value: l.vehicleId, label: `${l.vehicleCode}（${l.driverName} 收车于 ${l.returnStation}）` }));
+  void returnedIds;
+  return (
+    <Modal open={!!ov} title="安排停运后车辆充电" onCancel={onClose}
+      onOk={async () => {
+        if (!vehicleId) return message.warning('请选择车辆');
+        try {
+          await api.post('/dispatch/storm-charge-plan', {
+            suspensionId, vehicleId, targetBattery: target, slot, note,
+          });
+          message.success('充电安排已登记'); onDone();
+        } catch (e: any) { message.error(e.message); }
+      }}>
+      <Space direction="vertical" style={{ width: '100%', marginTop: 8 }}>
+        <Select style={{ width: '100%' }} placeholder="选择已收车车辆" value={vehicleId} onChange={setVehicleId}
+          options={options} />
+        <InputNumber addonBefore="目标电量%" min={20} max={100} value={target} onChange={v => setTarget(v || 100)} />
+        <Input addonBefore="充电桩位" placeholder="如 A区3号桩" value={slot} onChange={e => setSlot(e.target.value)} />
+        <Input.TextArea rows={2} placeholder="备注" value={note} onChange={e => setNote(e.target.value)} />
+      </Space>
+    </Modal>
+  );
 }

@@ -13,7 +13,8 @@ const REFUND_STATUS: Record<string, { text: string; color: string }> = {
   approved: { text: '已核准待付款', color: 'blue' },
   rejected: { text: '已驳回', color: 'red' },
   escalated: { text: '主管处理中', color: 'purple' },
-  paid: { text: '已退款', color: 'green' },
+  paid: { text: '已出账', color: 'green' },
+  archived: { text: '已归档', color: 'default' },
 };
 
 export default function ServicePage() {
@@ -59,9 +60,11 @@ export default function ServicePage() {
   ];
 
   const openIncidents = (incidents || []).filter(i => ['open', 'processing', 'escalated'].includes(i.status));
+  const storm = wb?.storm;
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      {storm && <StormScriptCard storm={storm} refresh={refresh} />}
       <Alert type="info" showIcon
         message="客服工作台：游客退票、优先乘车争议、误乘与跳站投诉在此受理；责任不清的退票争议一键升级客服主管；同一张票/同一班车的全部沟通都沉淀在事件时间线。" />
       <div className="stat-row">
@@ -215,6 +218,54 @@ function incidentType(t: string) {
     priority_dispute: '优先争议', vehicle_fault: '车辆故障', handover_delay: '交班延误',
     storm_suspension: '暴雨停运', refund_request: '退票诉求', charter: '包车', info: '信息',
   } as Record<string, string>)[t] || t;
+}
+
+/** 暴雨停运统一口径：三类待处理 + 选项进度 + 批量核准暴雨退票 */
+function StormScriptCard({ storm, refresh }: { storm: any; refresh: () => void }) {
+  const [showScript, setShowScript] = useState(false);
+  return (
+    <Alert
+      type="error" showIcon
+      message={<Space wrap>
+        <b>暴雨临时停运 · 统一口径（{storm.suspension.code}）</b>
+        <Tag color="red">在途待选 {storm.pendingChoose.onboard}</Tag>
+        <Tag color="orange">排队待选 {storm.pendingChoose.queued}</Tag>
+        <Tag color="gold">未检票待选 {storm.pendingChoose.unchecked}</Tag>
+        <Button size="small" type="link" onClick={() => setShowScript(v => !v)}>
+          {showScript ? '收起口径' : '查看客服统一口径'}
+        </Button>
+      </Space>}
+      description={
+        <Space direction="vertical" style={{ width: '100%' }}>
+          <Space wrap size={20}>
+            <span>改乘 <b style={{ color: '#1677ff' }}>{storm.optionStats.transfer}</b></span>
+            <span>延期 <b style={{ color: '#722ed1' }}>{storm.optionStats.postpone}</b></span>
+            <span>退票 <b style={{ color: '#cf1322' }}>{storm.optionStats.refund}</b></span>
+            <span className="muted">退票待核准 {storm.refundPending} · 待财务付款 {storm.refundApproved} · 已付款 {storm.refundPaid}</span>
+            <span>退款合计 <b>{fen(storm.refundAmount)}</b>（改乘/延期结转票款 {fen(storm.carriedAmount)}，不流出）</span>
+          </Space>
+          {storm.refundPending > 0 && (
+            <Button size="small" danger type="primary"
+              onClick={() => Modal.confirm({
+                title: `批量核准 ${storm.refundPending} 笔暴雨退票？`,
+                content: '均为暴雨停运无责全额退票，按票种金额由系统生成；核准后统一同步财务确认出账。',
+                onOk: async () => {
+                  const r = await api.post(`/storm/${storm.suspension.id}/approve-refunds`,
+                    { note: '暴雨停运无责全额退票，客服批量核准' });
+                  message.success(`已批量核准 ${r.approved} 笔，合计 ${fen(r.amount)}，已同步财务`);
+                  refresh();
+                },
+              })}>批量核准暴雨退票（{storm.refundPending} 笔）</Button>
+          )}
+          {showScript && (
+            <Typography.Paragraph style={{ whiteSpace: 'pre-wrap', background: '#fff2f0', padding: 12, borderRadius: 6, marginBottom: 0 }}>
+              {storm.script}
+            </Typography.Paragraph>
+          )}
+        </Space>
+      }
+    />
+  );
 }
 function roleName(r: string) {
   return ({

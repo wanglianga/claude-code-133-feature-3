@@ -3,7 +3,7 @@ import {
   Card, Form, Select, InputNumber, Input, Button, Switch, Tag, Timeline, Typography,
   Space, Alert, Divider, Descriptions, Modal, Empty,
 } from 'antd';
-import { api, fen, TICKET_TYPE, TICKET_STATUS } from '../api';
+import { api, fen, TICKET_TYPE, TICKET_STATUS, STORM_CATEGORY, STORM_OPTION } from '../api';
 import { useAction, useApi } from '../hooks';
 
 export default function VisitorPage() {
@@ -193,12 +193,79 @@ function TicketDetail({ detail, onRefund, onChanged }: { detail: any; onRefund: 
           }));
         })}
       />
-      <Space>
-        <Button danger disabled={!canRefund} onClick={refund}>
-          {canRefund ? '申请退票' : '当前状态不可直接退票（如已上车请联系客服争议处理）'}
-        </Button>
-      </Space>
+      {detail.storm && <StormChoiceCard detail={detail} onChanged={onChanged} />}
+      {!detail.storm && (
+        <Space>
+          <Button danger disabled={!canRefund} onClick={refund}>
+            {canRefund ? '申请退票' : '当前状态不可直接退票（如已上车请联系客服争议处理）'}
+          </Button>
+        </Space>
+      )}
     </div>
+  );
+}
+
+/** 暴雨停运：游客对锁定车票三选一（改乘/延期/退票），金额按票种实时展示 */
+function StormChoiceCard({ detail, onChanged }: { detail: any; onChanged: () => void }) {
+  const { ticket, storm } = detail;
+  const [date, setDate] = useState(ticket.postponeDate || '');
+  const chosen = ticket.stormOption;
+  const f = storm.finance;
+  const choose = (option: 'transfer' | 'postpone' | 'refund') => {
+    const label = STORM_OPTION[option].text;
+    Modal.confirm({
+      title: `暴雨停运：确认选择「${label}」？`,
+      width: 460,
+      content: option === 'refund'
+        ? <div>按票种<b>全额退款 {fen(f.refundAmount)}</b>，免手续费；客服核准后由财务确认出账，1-3 个工作日原路退回。</div>
+        : option === 'transfer'
+          ? <div>免手续费，原票款 <b>{fen(f.transfer.carriedAmount)}</b> 结转；恢复运营后优先安排接驳/首班，排队顺位保留。</div>
+          : <div>免手续费，原票款 <b>{fen(f.postpone.carriedAmount)}</b> 结转至改期日；可在下方填写改期日期（默认次日）。</div>,
+      onOk: async () => {
+        await api.post(`/tickets/${ticket.id}/storm-option`,
+          option === 'postpone' ? { option, postponeDate: date || undefined } : { option });
+        onChanged();
+      },
+    });
+  };
+
+  return (
+    <Alert
+      style={{ marginTop: 12 }}
+      type="error" showIcon
+      message={<Space wrap>
+        <b>暴雨临时停运 · 车票已锁定（{storm.categoryLabel}）</b>
+        {chosen
+          ? <Tag color={STORM_OPTION[chosen]?.color}>已选择：{STORM_OPTION[chosen]?.text}{ticket.postponeDate ? ` · ${ticket.postponeDate}` : ''}</Tag>
+          : <Tag color="red">待选择</Tag>}
+      </Space>}
+      description={
+        <Space direction="vertical" style={{ width: '100%', marginTop: 8 }} size={10}>
+          <Typography.Text type="secondary">{f.policy.note}</Typography.Text>
+          {!chosen ? (
+            <Space wrap>
+              <Button type="primary" onClick={() => choose('transfer')}>
+                改乘（免手续费，优先接驳/首班）
+              </Button>
+              <span>
+                <Button onClick={() => choose('postpone')}>延期（票款结转）</Button>
+                <Input style={{ width: 150, marginLeft: 8 }} type="date"
+                  value={date} onChange={e => setDate(e.target.value)} placeholder="改期日期" />
+              </span>
+              <Button danger onClick={() => choose('refund')}>
+                退票（全额 {fen(f.refundAmount)}）
+              </Button>
+            </Space>
+          ) : chosen === 'refund' ? (
+            <Typography.Text>退票单已提交：客服核准 → 财务确认出账 → 同步归档，进度见上方时间线。</Typography.Text>
+          ) : chosen === 'postpone' ? (
+            <Typography.Text>已登记延期至 <b>{ticket.postponeDate}</b>，票款 {fen(f.postpone.carriedAmount)} 结转，优先/轮椅资格保留，客服与财务已同步备案。</Typography.Text>
+          ) : (
+            <Typography.Text>已登记改乘：运营恢复后优先安排接驳/首班，原排队顺位保留，票款 {fen(f.transfer.carriedAmount)} 结转。</Typography.Text>
+          )}
+        </Space>
+      }
+    />
   );
 }
 

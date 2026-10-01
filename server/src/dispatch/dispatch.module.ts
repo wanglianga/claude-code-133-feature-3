@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import {
   Vehicle, Driver, Trip, Ticket, QueueEntry, Station, RouteLine, Weather,
   RoadControl, GeofenceEvent, SafetyCheck, CharterOrder, Incident, Refund,
+  Broadcast, StormSuspension, StormReturnLog, StormChargePlan,
 } from '../entities';
 import { DispatchService } from './dispatch.service';
 import { DispatchController } from './dispatch.controller';
@@ -13,6 +14,7 @@ import { IncidentsModule } from '../incidents/incidents.module';
     TypeOrmModule.forFeature([
       Vehicle, Driver, Trip, Ticket, QueueEntry, Station, RouteLine, Weather,
       RoadControl, GeofenceEvent, SafetyCheck, CharterOrder, Incident, Refund,
+      Broadcast, StormSuspension, StormReturnLog, StormChargePlan,
     ]),
     IncidentsModule,
   ],

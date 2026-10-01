@@ -50,6 +50,33 @@ export const TICKET_STATUS: Record<string, { text: string; color: string }> = {
   cancelled: { text: '已取消', color: 'default' },
 };
 
+export const STORM_CATEGORY: Record<string, { text: string; color: string }> = {
+  onboard: { text: '在途车辆', color: 'red' },
+  queued: { text: '站点排队', color: 'orange' },
+  unchecked: { text: '未检票', color: 'gold' },
+};
+
+export const STORM_OPTION: Record<string, { text: string; color: string }> = {
+  transfer: { text: '改乘', color: 'blue' },
+  postpone: { text: '延期', color: 'purple' },
+  refund: { text: '退票', color: 'red' },
+};
+
+export const REFUND_KIND: Record<string, { text: string; color: string }> = {
+  refund: { text: '退票', color: 'red' },
+  transfer: { text: '改乘', color: 'blue' },
+  postpone: { text: '延期', color: 'purple' },
+};
+
+export const REFUND_STATUS: Record<string, { text: string; color: string }> = {
+  pending: { text: '待审核', color: 'orange' },
+  approved: { text: '已核准待付款', color: 'blue' },
+  rejected: { text: '已驳回', color: 'red' },
+  escalated: { text: '主管处理中', color: 'purple' },
+  paid: { text: '已退款待归档', color: 'green' },
+  archived: { text: '已归档', color: 'default' },
+};
+
 export const TRIP_STATUS: Record<string, { text: string; color: string }> = {
   scheduled: { text: '计划中', color: 'default' },
   boarding: { text: '上客中', color: 'blue' },

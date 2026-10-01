@@ -35,4 +35,11 @@ export class TicketsController {
   refund(@Param('id') id: string, @Body() dto: RefundRequestDto) {
     return this.svc.requestRefund(Number(id), dto);
   }
+
+  /** 暴雨停运：游客对被锁定车票三选一（改乘/延期/退票） */
+  @Post(':id/storm-option')
+  stormOption(@Param('id') id: string,
+              @Body() body: { option: 'transfer' | 'postpone' | 'refund'; postponeDate?: string }) {
+    return this.svc.stormChoose(Number(id), body.option, { postponeDate: body.postponeDate });
+  }
 }

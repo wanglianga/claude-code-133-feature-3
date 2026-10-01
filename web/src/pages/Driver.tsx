@@ -217,5 +217,5 @@ function driverStatus(s: string) {
   return ({ off: '休息/未上岗', on_duty: '在岗待命', driving: '驾驶中', rest: '强制休息', handover: '交班延误' } as any)[s] || s;
 }
 function vehicleStatus(s?: string) {
-  return ({ idle: '待命', running: '在运', charging: '充电中', maintenance: '维保', breakdown: '故障' } as any)[s || ''] || s;
+  return ({ idle: '待命', running: '在运', returning: '暴雨待收车', charging: '充电中', maintenance: '维保', breakdown: '故障' } as any)[s || ''] || s;
 }
